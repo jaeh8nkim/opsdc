@@ -54,8 +54,13 @@ async def run_unvicorn(app: FastAPI, server_args, server_address, max_retries=5)
             app.server_args = server_args
             config = uvicorn.Config(app, host=server_address, port=server_port, log_level="warning")
             server = uvicorn.Server(config)
-            server.should_exit = True
-            await server.serve()
+            # Call startup + main_loop separately instead of serve().
+            # serve() with should_exit=True calls shutdown() after startup,
+            # closing all sockets before main_loop can accept connections.
+            if not config.loaded:
+                config.load()
+            server.lifespan = config.lifespan_class(config)
+            await server.startup()
             server_task = asyncio.create_task(server.main_loop())
             break
         except (OSError, SystemExit) as e:

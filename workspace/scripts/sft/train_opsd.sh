@@ -45,6 +45,27 @@ SD_SRC="${WORKSPACE_ROOT}/src"
 export PYTHONPATH="${VERL_ROOT}:${SD_SRC}:${PYTHONPATH}"
 echo "PYTHONPATH: $PYTHONPATH"
 
+# Fix LD_LIBRARY_PATH: torch 2.9.1+cu128 bundles CUDA 12.8 libs but the NVIDIA
+# driver only supports CUDA 12.2.  Subprocesses (SGLang workers) inherit the
+# system LD_LIBRARY_PATH which points to CUDA 12.2 libs, causing symbol errors.
+# Prepend torch's bundled NVIDIA CUDA libs so subprocesses find CUDA 12.8.
+SITE_PKGS=$(python3 -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
+TORCH_CUDA_LIBS="${SITE_PKGS}/torch/lib"
+for pkg in cuda_runtime cublas cudnn cuda_cupti cufft curand cusolver cusparse nccl nvtx; do
+    d="${SITE_PKGS}/nvidia/${pkg}/lib"
+    [ -d "$d" ] && TORCH_CUDA_LIBS="${TORCH_CUDA_LIBS}:${d}"
+done
+export LD_LIBRARY_PATH="${TORCH_CUDA_LIBS}:${LD_LIBRARY_PATH}"
+echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+
+# Disable tokenizer parallelism to prevent rayon thread pool exhaustion
+# across many Ray worker processes.
+export TOKENIZERS_PARALLELISM=false
+
+# Force torch.inductor to compile in the main process instead of spawning
+# subprocesses, which crash due to CUDA driver 12.2 vs 12.8 mismatch.
+export TORCHINDUCTOR_COMPILE_THREADS=1
+
 
 # =============================================================================
 # Required environment variables
