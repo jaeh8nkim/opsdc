@@ -284,7 +284,7 @@ python3 -m self_distill_hybrid.main_opsd \
     trainer.save_freq="${SAVE_FREQ}" \
     trainer.default_local_dir="${CHECKPOINT_DIR}" \
     trainer.logger='["console"]' \
-    trainer.val_before_train=true \
+    trainer.val_before_train="${VAL_BEFORE_TRAIN:-true}" \
     opsd.detailed_log_dir="${DETAILED_LOG_DIR}" \
     ${TRAIN_MAX_SAMPLES:+data.train_max_samples=${TRAIN_MAX_SAMPLES}} \
     ${REWARD_FN_PATH:+custom_reward_function.path="${REWARD_FN_PATH}"} \
