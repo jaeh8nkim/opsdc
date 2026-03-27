@@ -32,9 +32,20 @@ logger = logging.getLogger(__name__)
 @hydra.main(config_path="config", config_name="opsd_trainer", version_base=None)
 def main(config):
     """Main entry point for OPSD training with Hydra configuration."""
+    from omegaconf import open_dict
     from verl.utils.device import auto_set_device
 
     auto_set_device(config)
+
+    # Co-locate checkpoints and detailed logs in Hydra's timestamp dir
+    # (outputs/yyyy-mm-dd/HH-MM-SS/) so everything for one run lives together.
+    hydra_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    if os.environ.get("OUTPUT_DIR") is None:
+        with open_dict(config):
+            config.trainer.default_local_dir = os.path.join(hydra_dir, "checkpoints")
+            config.opsd.detailed_log_dir = os.path.join(hydra_dir, "detailed_logs")
+        logger.info("Co-locating outputs in Hydra dir: %s", hydra_dir)
+
     run_opsd(config)
 
 

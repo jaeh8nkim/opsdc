@@ -38,5 +38,15 @@
     "length_prune_teacher_percent_reduce": {
         "prefix": "Solve the following math problem correctly using {percent_reduce}% fewer tokens than you normally would. Be more concise — cut unnecessary elaboration, redundant steps, and verbose explanations while preserving correctness.\n\nThe last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n",
         "suffix": "\n\nRemember to put your answer on its own line after \"Answer:\"."
+    },
+    "epiphany_turn2_incorrect": {
+        "template": "The attempted solution is incorrect. The correct answer is: {ground_truth}\n\nYour reasoning went wrong somewhere. Diagnose your error, then reconstruct the correct solution path working backward from the answer. Write study notes that your future self could recall to solve this type of problem. Cover:\n\n- Recognition: What type of problem is this? What words or structure in the statement should trigger the right method?\n- Method: The correct technique, stated with concrete math. Give the key formula, identity, or transformation — not just its name.\n- Steps: Walk through the solution in order. Show the critical intermediate expressions that lead to {ground_truth}.\n- Your error: What specifically went wrong in your attempt? Why did it seem right? What check would have caught it?\n- Traps: Other wrong paths someone might take on this type of problem and why they fail.\n\nBe specific and mathematical. Do NOT include the final numerical answer in your notes."
+    },
+    "epiphany_turn2_correct": {
+        "template": "The solution is correct. The correct answer is: {ground_truth}\n\nYour reasoning worked. Now distill it into study notes that your future self could recall to solve this type of problem efficiently. Cover:\n\n- Recognition: What type of problem is this? What words or structure in the statement should trigger the right method?\n- Method: The core technique, stated with concrete math. Give the key formula, identity, or transformation — not just its name.\n- Steps: The most direct path through the solution. Show the critical intermediate expressions and skip dead ends from your reasoning.\n- Verification: How to check intermediate results and the final answer.\n- Traps: Where a solver could go wrong on this type of problem — specific algebraic or logical pitfalls.\n\nBe specific and mathematical. Do NOT include the final numerical answer in your notes."
+    },
+    "epiphany_teacher": {
+        "prefix": "You recall the following from studying similar problems:\n\n",
+        "suffix": "\n\nNow use what you recall to solve the following problem correctly and efficiently."
     }
 }

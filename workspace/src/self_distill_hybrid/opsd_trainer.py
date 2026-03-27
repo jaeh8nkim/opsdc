@@ -116,12 +116,15 @@ class OPSDTrainer:
         self.rollout_log_dir = os.path.join(self.log_dir, "rollout")
         self.opsd_log_dir = os.path.join(self.log_dir, "opsd")
         self.val_log_dir = os.path.join(self.log_dir, "val_generations")
+        self.epiphany_log_dir = os.path.join(self.log_dir, "epiphany")
         os.makedirs(self.rollout_log_dir, exist_ok=True)
         os.makedirs(self.opsd_log_dir, exist_ok=True)
         os.makedirs(self.val_log_dir, exist_ok=True)
+        os.makedirs(self.epiphany_log_dir, exist_ok=True)
         py_logger.info("Rollout logs -> %s", self.rollout_log_dir)
         py_logger.info("OPSD logs    -> %s", self.opsd_log_dir)
         py_logger.info("Val gen logs -> %s", self.val_log_dir)
+        py_logger.info("Epiphany logs-> %s", self.epiphany_log_dir)
 
         # Create dataloader
         self._create_dataloader(train_dataset, collate_fn)
@@ -714,11 +717,16 @@ class OPSDTrainer:
                 metrics["sd/max_student_token_count"] = max(student_token_counts) if student_token_counts else 0
                 metrics["sd/min_student_token_count"] = min(student_token_counts) if student_token_counts else 0
 
-                # Truncation rate: response filled the entire allocated token buffer
+                # Truncation rate: response hit the generation cap.
+                # Use sd_max_tokens (the actual generation limit) rather than
+                # the tensor buffer size, which may be much larger.
+                _gen_cap = int(
+                    self.opsd_config.get("sd_max_tokens", 0)
+                ) or _max_resp_tokens
                 _n_truncated = sum(
                     1
                     for tc in student_token_counts
-                    if tc == _max_resp_tokens
+                    if tc >= _gen_cap
                 )
                 metrics["sd/truncation_rate"] = _n_truncated / max(1, batch_size)
                 metrics["sd/n_truncated"] = _n_truncated
@@ -728,9 +736,33 @@ class OPSDTrainer:
                     teacher_lens = [len(t) for t in teacher_solutions]
                     metrics["sd/avg_teacher_response_len"] = sum(teacher_lens) / max(1, len(teacher_lens))
 
+                # ---- Phase 2.5: Generate epiphanies (if enabled) ----
+                epiphanies = None
+                raw_turn2_outputs = None
+                if self.opsd_config.get("use_epiphany", False):
+                    epiphany_t0 = time.time()
+                    epiphanies, raw_turn2_outputs = self._generate_epiphanies(
+                        batch, responses, correct_mask,
+                    )
+                    epiphany_time = time.time() - epiphany_t0
+                    metrics["timing/epiphany_s"] = epiphany_time
+
+                    # Turn 2 token metrics
+                    epi_token_lens = [
+                        len(self.tokenizer.encode(r)) for r in raw_turn2_outputs
+                    ]
+                    epiphany_max_tokens = int(self.opsd_config.get("epiphany_max_tokens", 2048))
+                    metrics["epiphany/avg_tokens"] = (
+                        sum(epi_token_lens) / max(1, len(epi_token_lens))
+                    )
+                    metrics["epiphany/max_tokens"] = max(epi_token_lens) if epi_token_lens else 0
+                    n_epi_clipped = sum(1 for t in epi_token_lens if t >= epiphany_max_tokens)
+                    metrics["epiphany/clip_pct"] = n_epi_clipped / max(1, len(epi_token_lens))
+                    metrics["epiphany/n_clipped"] = n_epi_clipped
+
                 # ---- Phase 3: Train (OPSD JSD on ALL responses) ----
                 train_t0 = time.time()
-                opsd_metrics = self._opsd_update(batch, responses)
+                opsd_metrics = self._opsd_update(batch, responses, epiphanies=epiphanies)
                 train_time = time.time() - train_t0
 
                 metrics.update(opsd_metrics)
@@ -751,6 +783,11 @@ class OPSDTrainer:
                 # ---- Log samples ----
                 if self.global_steps % self.log_freq == 0:
                     self._log_rollout_samples(batch, responses, correct_mask, predictions)
+                    if epiphanies is not None:
+                        self._log_epiphany_samples(
+                            batch, responses, correct_mask, predictions,
+                            epiphanies, raw_turn2_outputs,
+                        )
 
                 # ---- Phase 4: Validation ----
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -847,10 +884,115 @@ class OPSDTrainer:
         return responses, correct_mask, predictions
 
     # ------------------------------------------------------------------
+    # Phase 2.5: Epiphany generation
+    # ------------------------------------------------------------------
+
+    def _get_prompt_config(self):
+        """Lazy-load prompt templates from config/prompts.json."""
+        if not hasattr(self, "_prompt_config"):
+            from pathlib import Path
+
+            config_path = Path(__file__).resolve().parents[2] / "config" / "prompts.json"
+            self._prompt_config = json.loads(config_path.read_text())
+        return self._prompt_config
+
+    @staticmethod
+    def _strip_think_block(text: str) -> str:
+        """Remove <think>...</think> block, return only the content after it."""
+        idx = text.rfind("</think>")
+        if idx >= 0:
+            return text[idx + len("</think>"):].strip()
+        return text.strip()
+
+    def _generate_epiphanies(
+        self,
+        original_batch: DataProto,
+        responses: list[str],
+        correct_mask: list[bool],
+    ) -> tuple[list[str], list[str]]:
+        """Generate Turn 2 epiphany memos via self-reflection.
+
+        For each sample, builds a multi-turn prompt:
+          [user: original question]
+          [assistant: student Turn 1 response]
+          [user: correctness feedback + memo instruction]
+
+        Then generates the epiphany via sglang, strips <think> blocks,
+        and returns cleaned epiphany text for teacher context.
+
+        Returns:
+            (epiphanies, raw_turn2_outputs) — stripped memos and raw generations.
+        """
+        prompts_cfg = self._get_prompt_config()
+        turn2_correct = prompts_cfg["epiphany_turn2_correct"]["template"]
+        turn2_incorrect = prompts_cfg["epiphany_turn2_incorrect"]["template"]
+
+        sft_prompts = list(original_batch.non_tensor_batch["sft_prompt"])
+        ground_truths = list(original_batch.non_tensor_batch["ground_truth"])
+
+        batch_size = len(responses)
+        turn2_raw_prompts = np.empty(batch_size, dtype=object)
+
+        for i in range(batch_size):
+            # Parse original question from sft_prompt
+            sft_msgs = json.loads(sft_prompts[i])
+            original_user_content = sft_msgs[0]["content"]
+
+            # Build Turn 2 instruction based on correctness
+            if correct_mask[i]:
+                turn2_content = turn2_correct.format(ground_truth=ground_truths[i])
+            else:
+                turn2_content = turn2_incorrect.format(ground_truth=ground_truths[i])
+
+            # Multi-turn conversation
+            turn2_raw_prompts[i] = [
+                {"role": "user", "content": original_user_content},
+                {"role": "assistant", "content": responses[i]},
+                {"role": "user", "content": turn2_content},
+            ]
+
+        # Build DataProto for Turn 2 generation
+        turn2_batch = DataProto.from_single_dict({
+            "dummy_tensor": torch.zeros(batch_size, 1, dtype=torch.uint8),
+        })
+        turn2_batch.non_tensor_batch["raw_prompt"] = turn2_raw_prompts
+        turn2_batch.non_tensor_batch["uid"] = np.array(
+            [str(uuid.uuid4()) for _ in range(batch_size)], dtype=object,
+        )
+        turn2_batch.meta_info["global_steps"] = self.global_steps
+        turn2_batch.meta_info["max_new_tokens"] = int(
+            self.opsd_config.get("epiphany_max_tokens", 2048)
+        )
+
+        # Pad batch to divisor for distributed generation
+        size_divisor = self.config.actor_rollout_ref.rollout.get("agent", {}).get(
+            "num_workers", self.actor_rollout_wg.world_size
+        )
+        turn2_batch_padded, pad_size = pad_dataproto_to_divisor(turn2_batch, size_divisor)
+
+        # Generate Turn 2 responses
+        turn2_output = self.async_rollout_manager.generate_sequences(turn2_batch_padded)
+        turn2_output = unpad_dataproto(turn2_output, pad_size=pad_size)
+
+        # Decode Turn 2 responses
+        prompt_length = turn2_output.batch["prompts"].shape[1]
+        raw_turn2_outputs = []
+        epiphanies = []
+        for i in range(batch_size):
+            response_ids = turn2_output.batch["responses"][i]
+            resp_attn_mask = turn2_output.batch["attention_mask"][i, prompt_length:]
+            valid_ids = response_ids[resp_attn_mask.bool()]
+            raw_text = self.tokenizer.decode(valid_ids, skip_special_tokens=True)
+            raw_turn2_outputs.append(raw_text)
+            epiphanies.append(self._strip_think_block(raw_text))
+
+        return epiphanies, raw_turn2_outputs
+
+    # ------------------------------------------------------------------
     # Phase 3: OPSD Update
     # ------------------------------------------------------------------
 
-    def _opsd_update(self, original_batch: DataProto, responses: list[str]) -> dict:
+    def _opsd_update(self, original_batch: DataProto, responses: list[str], epiphanies: list[str] = None) -> dict:
         """Build OPSD batch and dispatch JSD training to workers.
 
         Trains on ALL responses (no correctness filtering).
@@ -858,12 +1000,31 @@ class OPSDTrainer:
         Args:
             original_batch: Original batch with sd_prompt and sft_prompt.
             responses: ALL student-generated response strings.
+            epiphanies: Optional list of stripped epiphany memos. When provided
+                and ``use_epiphany`` is enabled, teacher prompts are constructed
+                on-the-fly: [question] + [recall prefix] + [epiphany] + [suffix].
 
         Returns:
             Dictionary of training metrics.
         """
-        teacher_prompts = list(original_batch.non_tensor_batch["sd_prompt"])
         student_prompts = list(original_batch.non_tensor_batch["sft_prompt"])
+
+        if epiphanies is not None and self.opsd_config.get("use_epiphany", False):
+            # Build teacher prompts dynamically from epiphanies
+            epiphany_cfg = self._get_prompt_config()["epiphany_teacher"]
+            teacher_prompts = []
+            for i in range(len(responses)):
+                sft_msgs = json.loads(student_prompts[i])
+                question_content = sft_msgs[0]["content"]
+                content = (
+                    question_content + "\n\n"
+                    + epiphany_cfg["prefix"]
+                    + epiphanies[i]
+                    + epiphany_cfg["suffix"]
+                )
+                teacher_prompts.append(json.dumps([{"role": "user", "content": content}]))
+        else:
+            teacher_prompts = list(original_batch.non_tensor_batch["sd_prompt"])
 
         opsd_batch = build_opsd_batch(
             teacher_prompts=teacher_prompts,
@@ -977,6 +1138,81 @@ class OPSDTrainer:
             })
 
         step_file = os.path.join(self.rollout_log_dir, f"step_{self.global_steps:06d}.json")
+        with open(step_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {"step": self.global_steps, "n_samples": n_log, "samples": samples},
+                f, indent=2, ensure_ascii=False,
+            )
+
+    def _log_epiphany_samples(
+        self,
+        batch: DataProto,
+        responses: list[str],
+        correct_mask: list[bool],
+        predictions: list[str],
+        epiphanies: list[str],
+        raw_turn2_outputs: list[str],
+    ):
+        """Log full epiphany pipeline trace: Turn 1 in/out, Turn 2 in/out, teacher input."""
+        n_log = min(self.log_sample_count, len(responses))
+        if n_log == 0:
+            return
+
+        sft_prompts = list(batch.non_tensor_batch.get("sft_prompt", []))
+        ground_truths = list(batch.non_tensor_batch["ground_truth"])
+        prompts_cfg = self._get_prompt_config()
+        epiphany_cfg = prompts_cfg["epiphany_teacher"]
+        turn2_correct = prompts_cfg["epiphany_turn2_correct"]["template"]
+        turn2_incorrect = prompts_cfg["epiphany_turn2_incorrect"]["template"]
+
+        samples = []
+        for i in range(n_log):
+            # Turn 1 input
+            try:
+                turn1_input = json.loads(sft_prompts[i])
+            except (json.JSONDecodeError, TypeError, IndexError):
+                turn1_input = str(sft_prompts[i]) if i < len(sft_prompts) else ""
+
+            # Turn 2 input (multi-turn conversation)
+            sft_msgs = json.loads(sft_prompts[i]) if i < len(sft_prompts) else []
+            original_content = sft_msgs[0]["content"] if sft_msgs else ""
+            gt = ground_truths[i] if i < len(ground_truths) else ""
+            if correct_mask[i]:
+                turn2_user_content = turn2_correct.format(ground_truth=gt)
+            else:
+                turn2_user_content = turn2_incorrect.format(ground_truth=gt)
+
+            turn2_input = [
+                {"role": "user", "content": original_content},
+                {"role": "assistant", "content": responses[i]},
+                {"role": "user", "content": turn2_user_content},
+            ]
+
+            # Teacher input (reconstructed)
+            teacher_content = (
+                original_content + "\n\n"
+                + epiphany_cfg["prefix"]
+                + epiphanies[i]
+                + epiphany_cfg["suffix"]
+            )
+            teacher_input = [{"role": "user", "content": teacher_content}]
+
+            samples.append({
+                "sample_idx": i,
+                "is_correct": bool(correct_mask[i]),
+                "ground_truth": gt,
+                "prediction": str(predictions[i]),
+                "turn1_input": turn1_input,
+                "turn1_output": responses[i],
+                "turn1_tokens": len(self.tokenizer.encode(responses[i])),
+                "turn2_input": turn2_input,
+                "turn2_output_raw": raw_turn2_outputs[i],
+                "turn2_epiphany": epiphanies[i],
+                "turn2_tokens": len(self.tokenizer.encode(raw_turn2_outputs[i])),
+                "teacher_input": teacher_input,
+            })
+
+        step_file = os.path.join(self.epiphany_log_dir, f"step_{self.global_steps:06d}.json")
         with open(step_file, "w", encoding="utf-8") as f:
             json.dump(
                 {"step": self.global_steps, "n_samples": n_log, "samples": samples},

@@ -141,6 +141,14 @@ opsd:
   # If null, falls back to <checkpoint_dir>/detailed_logs.
   detailed_log_dir: null
 
+  # Epiphany (self-reflection) mode: after student generates (Turn 1),
+  # generate a self-reflection memo (Turn 2) and inject it into the
+  # teacher's prompt as informational advantage for JSD training.
+  use_epiphany: false
+
+  # Max tokens for Turn 2 epiphany generation (includes <think> block).
+  epiphany_max_tokens: 2048
+
 # ---------- Reward model (disabled for OPSD) ----------
 reward_model:
   enable: false
