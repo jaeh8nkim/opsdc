@@ -33,19 +33,25 @@ class SingleTurnAgentLoop(AgentLoopBase):
         self.response_length = self.config.actor_rollout_ref.rollout.response_length
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        messages = list(kwargs["raw_prompt"])
+        # Support pre-tokenized prompt IDs (bypass chat template).
+        # Used by epiphany rescue to do seamless token-level continuation.
+        if "prompt_ids" in kwargs and kwargs["prompt_ids"] is not None:
+            prompt_ids = list(kwargs["prompt_ids"])
+            images, videos, multi_modal_data = None, None, {}
+        else:
+            messages = list(kwargs["raw_prompt"])
 
-        # 1. extract images and videos from messages
-        multi_modal_data = await self.process_vision_info(messages)
-        images = multi_modal_data.get("images")
-        videos = multi_modal_data.get("videos")
+            # 1. extract images and videos from messages
+            multi_modal_data = await self.process_vision_info(messages)
+            images = multi_modal_data.get("images")
+            videos = multi_modal_data.get("videos")
 
-        # 2. apply chat template and tokenize
-        prompt_ids = await self.apply_chat_template(
-            messages,
-            images=images,
-            videos=videos,
-        )
+            # 2. apply chat template and tokenize
+            prompt_ids = await self.apply_chat_template(
+                messages,
+                images=images,
+                videos=videos,
+            )
 
         # 3. generate sequences
         metrics = {}

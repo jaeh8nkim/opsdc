@@ -148,6 +148,9 @@ opsd:
 
   # Max tokens for Turn 2 epiphany generation (includes <think> block).
   epiphany_max_tokens: 2048
+  # Tokens reserved for rescue generation when Turn 2 is truncated.
+  # Phase 1 gets (epiphany_max_tokens - epiphany_rescue_tokens), phase 2 gets this.
+  epiphany_rescue_tokens: 1024
 
 # ---------- Reward model (disabled for OPSD) ----------
 reward_model:

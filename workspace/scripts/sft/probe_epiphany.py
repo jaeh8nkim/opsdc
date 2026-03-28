@@ -258,9 +258,11 @@ def show_samples(epiphany_dir, step=None, n=1):
             t1_tok = s.get("turn1_tokens", "?")
             t2_tok = s.get("turn2_tokens", "?")
 
+            rescued = s.get("rescued", False)
             w = 60
             print("=" * w)
-            print(f" Step {step_num} | Sample {idx} | {status} (pred={pred}, gt={gt})")
+            rescued_tag = " | RESCUED" if rescued else ""
+            print(f" Step {step_num} | Sample {idx} | {status} (pred={pred}, gt={gt}){rescued_tag}")
             print("=" * w)
 
             # Turn 1 Input

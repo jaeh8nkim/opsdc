@@ -16,6 +16,8 @@ Key differences from SelfDistillTrainer (sd_trainer.py):
 import json
 import logging
 import os
+
+logger = logging.getLogger(__name__)
 import time
 import uuid
 from collections import defaultdict
@@ -739,26 +741,56 @@ class OPSDTrainer:
                 # ---- Phase 2.5: Generate epiphanies (if enabled) ----
                 epiphanies = None
                 raw_turn2_outputs = None
+                rescue_meta = None
                 if self.opsd_config.get("use_epiphany", False):
                     epiphany_t0 = time.time()
-                    epiphanies, raw_turn2_outputs = self._generate_epiphanies(
-                        batch, responses, correct_mask,
+                    epiphanies, raw_turn2_outputs, rescue_meta = (
+                        self._generate_epiphanies(
+                            batch, responses, correct_mask,
+                        )
                     )
                     epiphany_time = time.time() - epiphany_t0
                     metrics["timing/epiphany_s"] = epiphany_time
 
-                    # Turn 2 token metrics
+                    # Turn 2 token metrics (on stitched outputs)
                     epi_token_lens = [
                         len(self.tokenizer.encode(r)) for r in raw_turn2_outputs
                     ]
-                    epiphany_max_tokens = int(self.opsd_config.get("epiphany_max_tokens", 2048))
+                    epiphany_max_tokens = int(
+                        self.opsd_config.get("epiphany_max_tokens", 2048)
+                    )
+                    rescue_tokens = int(
+                        self.opsd_config.get("epiphany_rescue_tokens", 1024)
+                    )
                     metrics["epiphany/avg_tokens"] = (
                         sum(epi_token_lens) / max(1, len(epi_token_lens))
                     )
-                    metrics["epiphany/max_tokens"] = max(epi_token_lens) if epi_token_lens else 0
-                    n_epi_clipped = sum(1 for t in epi_token_lens if t >= epiphany_max_tokens)
-                    metrics["epiphany/clip_pct"] = n_epi_clipped / max(1, len(epi_token_lens))
-                    metrics["epiphany/n_clipped"] = n_epi_clipped
+                    metrics["epiphany/max_tokens"] = (
+                        max(epi_token_lens) if epi_token_lens else 0
+                    )
+
+                    # Phase 2 clipping: did the final study notes get truncated?
+                    rescued_set = rescue_meta.get("rescued_indices", set())
+                    rescue_tok_lens = rescue_meta.get("rescue_token_lens", [])
+                    n_clipped = 0
+                    rescue_j = 0
+                    for i, tl in enumerate(epi_token_lens):
+                        if i in rescued_set:
+                            # Rescued sample: clipped if rescue hit its budget
+                            if rescue_tok_lens[rescue_j] >= rescue_tokens - 1:
+                                n_clipped += 1
+                            rescue_j += 1
+                        else:
+                            # Non-rescued: clipped if hit total budget
+                            if tl >= epiphany_max_tokens - 1:
+                                n_clipped += 1
+                    metrics["epiphany/clip_pct"] = n_clipped / max(
+                        1, len(epi_token_lens)
+                    )
+                    metrics["epiphany/n_clipped"] = n_clipped
+                    metrics["epiphany/n_rescued"] = rescue_meta.get(
+                        "n_rescued", 0
+                    )
 
                 # ---- Phase 3: Train (OPSD JSD on ALL responses) ----
                 train_t0 = time.time()
@@ -786,7 +818,7 @@ class OPSDTrainer:
                     if epiphanies is not None:
                         self._log_epiphany_samples(
                             batch, responses, correct_mask, predictions,
-                            epiphanies, raw_turn2_outputs,
+                            epiphanies, raw_turn2_outputs, rescue_meta,
                         )
 
                 # ---- Phase 4: Validation ----
@@ -909,7 +941,7 @@ class OPSDTrainer:
         original_batch: DataProto,
         responses: list[str],
         correct_mask: list[bool],
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], dict]:
         """Generate Turn 2 epiphany memos via self-reflection.
 
         For each sample, builds a multi-turn prompt:
@@ -920,8 +952,14 @@ class OPSDTrainer:
         Then generates the epiphany via sglang, strips <think> blocks,
         and returns cleaned epiphany text for teacher context.
 
+        If the generation is truncated (hits the phase 1 budget), a rescue
+        phase continues generation at the token level — either force-closing
+        the <think> block first (if truncated mid-reasoning) or continuing
+        the study notes (if truncated mid-notes).
+
         Returns:
-            (epiphanies, raw_turn2_outputs) — stripped memos and raw generations.
+            (epiphanies, raw_turn2_outputs, rescue_meta) — stripped memos,
+            raw generations, and rescue metadata dict.
         """
         prompts_cfg = self._get_prompt_config()
         turn2_correct = prompts_cfg["epiphany_turn2_correct"]["template"]
@@ -929,6 +967,10 @@ class OPSDTrainer:
 
         sft_prompts = list(original_batch.non_tensor_batch["sft_prompt"])
         ground_truths = list(original_batch.non_tensor_batch["ground_truth"])
+
+        epiphany_max_tokens = int(self.opsd_config.get("epiphany_max_tokens", 2048))
+        rescue_tokens = int(self.opsd_config.get("epiphany_rescue_tokens", 1024))
+        phase1_budget = epiphany_max_tokens - rescue_tokens
 
         batch_size = len(responses)
         turn2_raw_prompts = np.empty(batch_size, dtype=object)
@@ -951,7 +993,7 @@ class OPSDTrainer:
                 {"role": "user", "content": turn2_content},
             ]
 
-        # Build DataProto for Turn 2 generation
+        # Build DataProto for Turn 2 generation (phase 1)
         turn2_batch = DataProto.from_single_dict({
             "dummy_tensor": torch.zeros(batch_size, 1, dtype=torch.uint8),
         })
@@ -960,9 +1002,7 @@ class OPSDTrainer:
             [str(uuid.uuid4()) for _ in range(batch_size)], dtype=object,
         )
         turn2_batch.meta_info["global_steps"] = self.global_steps
-        turn2_batch.meta_info["max_new_tokens"] = int(
-            self.opsd_config.get("epiphany_max_tokens", 2048)
-        )
+        turn2_batch.meta_info["max_new_tokens"] = phase1_budget
 
         # Pad batch to divisor for distributed generation
         size_divisor = self.config.actor_rollout_ref.rollout.get("agent", {}).get(
@@ -970,7 +1010,7 @@ class OPSDTrainer:
         )
         turn2_batch_padded, pad_size = pad_dataproto_to_divisor(turn2_batch, size_divisor)
 
-        # Generate Turn 2 responses
+        # Generate Turn 2 responses (phase 1)
         turn2_output = self.async_rollout_manager.generate_sequences(turn2_batch_padded)
         turn2_output = unpad_dataproto(turn2_output, pad_size=pad_size)
 
@@ -986,7 +1026,113 @@ class OPSDTrainer:
             raw_turn2_outputs.append(raw_text)
             epiphanies.append(self._strip_think_block(raw_text))
 
-        return epiphanies, raw_turn2_outputs
+        # ------------------------------------------------------------------
+        # Rescue phase: continue truncated generations at the token level
+        # ------------------------------------------------------------------
+        think_close_ids = self.tokenizer.encode(
+            "\n</think>\n", add_special_tokens=False,
+        )
+
+        rescue_indices = []  # list of (batch_idx, rescue_type)
+        rescue_prompt_ids = []
+        rescued_set = set()
+
+        for i in range(batch_size):
+            token_len = len(self.tokenizer.encode(raw_turn2_outputs[i]))
+            if token_len < phase1_budget - 1:
+                continue  # completed naturally
+
+            # Get original prompt + response token IDs from phase 1.
+            # prompts are left-padded — strip padding via attention mask.
+            prompt_mask = turn2_output.batch["attention_mask"][i, :prompt_length]
+            orig_prompt = turn2_output.batch["prompts"][i][prompt_mask.bool()].tolist()
+            resp_ids = turn2_output.batch["responses"][i]
+            resp_mask = turn2_output.batch["attention_mask"][i, prompt_length:]
+            valid_resp = resp_ids[resp_mask.bool()].tolist()
+
+            if "</think>" not in raw_turn2_outputs[i]:
+                # Truncated inside <think> — force-close, then generate notes
+                rescue_prompt_ids.append(orig_prompt + valid_resp + think_close_ids)
+                rescue_indices.append((i, "think_truncated"))
+            else:
+                # Truncated during study notes — continue as-is
+                rescue_prompt_ids.append(orig_prompt + valid_resp)
+                rescue_indices.append((i, "notes_truncated"))
+            rescued_set.add(i)
+
+        rescue_meta = {
+            "n_rescued": len(rescue_indices),
+            "rescued_indices": rescued_set,
+        }
+
+        if rescue_indices:
+            n_rescue = len(rescue_indices)
+
+            # Tell the agent loop worker to pad prompts to this length
+            # (instead of the default config prompt_length which is too
+            # small for rescue prompts that include the full phase 1 output).
+            max_rescue_len = max(len(ids) for ids in rescue_prompt_ids)
+
+            rescue_batch = DataProto.from_single_dict({
+                "dummy_tensor": torch.zeros(n_rescue, 1, dtype=torch.uint8),
+            })
+            rescue_batch.non_tensor_batch["prompt_ids"] = np.array(
+                rescue_prompt_ids, dtype=object,
+            )
+            rescue_batch.non_tensor_batch["_prompt_length"] = np.array(
+                [max_rescue_len] * n_rescue, dtype=object,
+            )
+            rescue_batch.non_tensor_batch["raw_prompt"] = np.array(
+                [turn2_raw_prompts[idx] for idx, _ in rescue_indices],
+                dtype=object,
+            )
+            rescue_batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(n_rescue)], dtype=object,
+            )
+            rescue_batch.meta_info["global_steps"] = self.global_steps
+            rescue_batch.meta_info["max_new_tokens"] = rescue_tokens
+
+            rescue_padded, rescue_pad = pad_dataproto_to_divisor(
+                rescue_batch, size_divisor,
+            )
+            rescue_output = self.async_rollout_manager.generate_sequences(
+                rescue_padded,
+            )
+            rescue_output = unpad_dataproto(rescue_output, pad_size=rescue_pad)
+
+            # Decode rescue outputs and stitch into raw_turn2_outputs
+            rescue_prompt_len = rescue_output.batch["prompts"].shape[1]
+            rescue_token_lens = []
+            for j, (idx, rescue_type) in enumerate(rescue_indices):
+                resp_ids = rescue_output.batch["responses"][j]
+                resp_mask = rescue_output.batch["attention_mask"][
+                    j, rescue_prompt_len:
+                ]
+                valid = resp_ids[resp_mask.bool()]
+                rescue_text = self.tokenizer.decode(
+                    valid, skip_special_tokens=True,
+                )
+                rescue_token_lens.append(len(valid))
+
+                if rescue_type == "think_truncated":
+                    raw_turn2_outputs[idx] = (
+                        raw_turn2_outputs[idx] + "\n</think>\n" + rescue_text
+                    )
+                else:
+                    raw_turn2_outputs[idx] = (
+                        raw_turn2_outputs[idx] + rescue_text
+                    )
+
+                epiphanies[idx] = self._strip_think_block(raw_turn2_outputs[idx])
+
+            rescue_meta["rescue_token_lens"] = rescue_token_lens
+            logger.info(
+                "Epiphany rescue: %d/%d samples continued "
+                "(phase1_budget=%d, rescue_budget=%d)",
+                n_rescue, batch_size, phase1_budget, rescue_tokens,
+            )
+
+        return epiphanies, raw_turn2_outputs, rescue_meta
 
     # ------------------------------------------------------------------
     # Phase 3: OPSD Update
@@ -1152,6 +1298,7 @@ class OPSDTrainer:
         predictions: list[str],
         epiphanies: list[str],
         raw_turn2_outputs: list[str],
+        rescue_meta: dict | None = None,
     ):
         """Log full epiphany pipeline trace: Turn 1 in/out, Turn 2 in/out, teacher input."""
         n_log = min(self.log_sample_count, len(responses))
@@ -1164,6 +1311,10 @@ class OPSDTrainer:
         epiphany_cfg = prompts_cfg["epiphany_teacher"]
         turn2_correct = prompts_cfg["epiphany_turn2_correct"]["template"]
         turn2_incorrect = prompts_cfg["epiphany_turn2_incorrect"]["template"]
+
+        rescued_set = (
+            rescue_meta.get("rescued_indices", set()) if rescue_meta else set()
+        )
 
         samples = []
         for i in range(n_log):
@@ -1202,6 +1353,7 @@ class OPSDTrainer:
                 "is_correct": bool(correct_mask[i]),
                 "ground_truth": gt,
                 "prediction": str(predictions[i]),
+                "rescued": i in rescued_set,
                 "turn1_input": turn1_input,
                 "turn1_output": responses[i],
                 "turn1_tokens": len(self.tokenizer.encode(responses[i])),

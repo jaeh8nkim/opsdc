@@ -26,7 +26,8 @@
 #   MODEL_PATH=Qwen/Qwen3-8B ./workspace/scripts/sft/train_epiphany.sh
 
 SD_MAX_TOKENS=8192
-EPIPHANY_MAX_TOKENS=4096
+EPIPHANY_MAX_TOKENS=8192
+EPIPHANY_RESCUE_TOKENS=2048
 
 MODEL_PATH=${MODEL_PATH:?MODEL_PATH environment variable is required} \
 SD_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts.parquet \
@@ -37,6 +38,7 @@ SD_TEMPERATURE=1.0 \
 SD_TOP_P=1.0 \
 SD_MAX_TOKENS=$SD_MAX_TOKENS \
 EPIPHANY_MAX_TOKENS=$EPIPHANY_MAX_TOKENS \
+EPIPHANY_RESCUE_TOKENS=$EPIPHANY_RESCUE_TOKENS \
 SFT_MAX_LENGTH=$(( SD_MAX_TOKENS + EPIPHANY_MAX_TOKENS + 2048 )) \
 TOTAL_EPOCHS=1 \
 TRAIN_MAX_SAMPLES=3200 \
@@ -60,4 +62,5 @@ EXPERIMENT_NAME=opsd_epiphany \
 RL_VAL_FILES="['./workspace/data/processed/val_math500.parquet', './workspace/data/processed/val_aime24.parquet', './workspace/data/processed/val_aime25.parquet']" \
 bash workspace/scripts/sft/train_opsd.sh \
     opsd.use_epiphany=true \
-    opsd.epiphany_max_tokens=$EPIPHANY_MAX_TOKENS
+    opsd.epiphany_max_tokens=$EPIPHANY_MAX_TOKENS \
+    opsd.epiphany_rescue_tokens=$EPIPHANY_RESCUE_TOKENS

@@ -544,11 +544,19 @@ class AgentLoopWorkerBase:
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
         # TODO(wuxibin): remove padding and use tensordict.
+        # Allow per-sample prompt_length override (used by epiphany rescue
+        # where prompts include the full phase 1 output and exceed the
+        # default config prompt_length).
+        prompt_length = int(kwargs.get(
+            "_prompt_length",
+            self.config.actor_rollout_ref.rollout.prompt_length,
+        ))
+        prompt_length = max(prompt_length, len(output.prompt_ids))
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.prompt_length,
+            max_length=prompt_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
