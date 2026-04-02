@@ -128,6 +128,18 @@ class OPSDTrainer:
         py_logger.info("Val gen logs -> %s", self.val_log_dir)
         py_logger.info("Epiphany logs-> %s", self.epiphany_log_dir)
 
+        # Load expert demonstrations (optional)
+        expert_demo_path = self.opsd_config.get("expert_demo_path", None)
+        if expert_demo_path:
+            import pandas as _pd
+            expert_df = _pd.read_parquet(expert_demo_path)
+            self.expert_demos = {}
+            for _, row in expert_df.iterrows():
+                self.expert_demos[row["question"]] = row["expert_demonstration"]
+            py_logger.info("Loaded %d expert demonstrations from %s", len(self.expert_demos), expert_demo_path)
+        else:
+            self.expert_demos = None
+
         # Create dataloader
         self._create_dataloader(train_dataset, collate_fn)
 
@@ -967,6 +979,7 @@ class OPSDTrainer:
 
         sft_prompts = list(original_batch.non_tensor_batch["sft_prompt"])
         ground_truths = list(original_batch.non_tensor_batch["ground_truth"])
+        questions = list(original_batch.non_tensor_batch["question"])
 
         epiphany_max_tokens = int(self.opsd_config.get("epiphany_max_tokens", 2048))
         rescue_tokens = int(self.opsd_config.get("epiphany_rescue_tokens", 1024))
@@ -980,11 +993,22 @@ class OPSDTrainer:
             sft_msgs = json.loads(sft_prompts[i])
             original_user_content = sft_msgs[0]["content"]
 
+            # Look up expert demonstration if available
+            format_kwargs = {"ground_truth": ground_truths[i]}
+            if self.expert_demos is not None:
+                q = questions[i]
+                if q not in self.expert_demos:
+                    raise KeyError(
+                        f"Expert demonstration not found for question: {q[:100]}... "
+                        f"All training questions must have expert demos."
+                    )
+                format_kwargs["expert_demonstration"] = self.expert_demos[q]
+
             # Build Turn 2 instruction based on correctness
             if correct_mask[i]:
-                turn2_content = turn2_correct.format(ground_truth=ground_truths[i])
+                turn2_content = turn2_correct.format(**format_kwargs)
             else:
-                turn2_content = turn2_incorrect.format(ground_truth=ground_truths[i])
+                turn2_content = turn2_incorrect.format(**format_kwargs)
 
             # Multi-turn conversation
             turn2_raw_prompts[i] = [
@@ -1158,14 +1182,23 @@ class OPSDTrainer:
         if epiphanies is not None and self.opsd_config.get("use_epiphany", False):
             # Build teacher prompts dynamically from epiphanies
             epiphany_cfg = self._get_prompt_config()["epiphany_teacher"]
+            ctx_token_limit = self.opsd_config.get("epiphany_teacher_ctx_tokens", None)
             teacher_prompts = []
             for i in range(len(responses)):
+                memo = epiphanies[i]
+                if ctx_token_limit is not None:
+                    token_ids = self.tokenizer.encode(memo)
+                    if len(token_ids) > ctx_token_limit:
+                        memo = self.tokenizer.decode(
+                            token_ids[:ctx_token_limit],
+                            skip_special_tokens=True,
+                        )
                 sft_msgs = json.loads(student_prompts[i])
                 question_content = sft_msgs[0]["content"]
                 content = (
                     question_content + "\n\n"
                     + epiphany_cfg["prefix"]
-                    + epiphanies[i]
+                    + memo
                     + epiphany_cfg["suffix"]
                 )
                 teacher_prompts.append(json.dumps([{"role": "user", "content": content}]))
@@ -1307,6 +1340,7 @@ class OPSDTrainer:
 
         sft_prompts = list(batch.non_tensor_batch.get("sft_prompt", []))
         ground_truths = list(batch.non_tensor_batch["ground_truth"])
+        questions = list(batch.non_tensor_batch["question"])
         prompts_cfg = self._get_prompt_config()
         epiphany_cfg = prompts_cfg["epiphany_teacher"]
         turn2_correct = prompts_cfg["epiphany_turn2_correct"]["template"]
@@ -1328,10 +1362,18 @@ class OPSDTrainer:
             sft_msgs = json.loads(sft_prompts[i]) if i < len(sft_prompts) else []
             original_content = sft_msgs[0]["content"] if sft_msgs else ""
             gt = ground_truths[i] if i < len(ground_truths) else ""
+
+            # Format Turn 2 template with expert demo if available
+            format_kwargs = {"ground_truth": gt}
+            expert_demo = None
+            if self.expert_demos is not None and i < len(questions):
+                expert_demo = self.expert_demos.get(questions[i], "")
+                format_kwargs["expert_demonstration"] = expert_demo
+
             if correct_mask[i]:
-                turn2_user_content = turn2_correct.format(ground_truth=gt)
+                turn2_user_content = turn2_correct.format(**format_kwargs)
             else:
-                turn2_user_content = turn2_incorrect.format(ground_truth=gt)
+                turn2_user_content = turn2_incorrect.format(**format_kwargs)
 
             turn2_input = [
                 {"role": "user", "content": original_content},
@@ -1348,7 +1390,7 @@ class OPSDTrainer:
             )
             teacher_input = [{"role": "user", "content": teacher_content}]
 
-            samples.append({
+            sample = {
                 "sample_idx": i,
                 "is_correct": bool(correct_mask[i]),
                 "ground_truth": gt,
@@ -1362,7 +1404,10 @@ class OPSDTrainer:
                 "turn2_epiphany": epiphanies[i],
                 "turn2_tokens": len(self.tokenizer.encode(raw_turn2_outputs[i])),
                 "teacher_input": teacher_input,
-            })
+            }
+            if expert_demo is not None:
+                sample["expert_demonstration"] = expert_demo
+            samples.append(sample)
 
         step_file = os.path.join(self.epiphany_log_dir, f"step_{self.global_steps:06d}.json")
         with open(step_file, "w", encoding="utf-8") as f:

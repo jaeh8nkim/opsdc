@@ -288,11 +288,6 @@ def show_samples(epiphany_dir, step=None, n=1):
             print(f"\n---- Turn 2 Output Raw ({t2_tok} tok) {'-' * max(0, w - 29 - len(str(t2_tok)))}")
             print(t2_raw)
 
-            # Epiphany (stripped)
-            epi = s.get("turn2_epiphany", "")
-            print(f"\n---- Epiphany (stripped) {'-' * (w - 24)}")
-            print(epi)
-
             # Teacher Input
             teacher = s.get("teacher_input", [])
             teacher_content = teacher[0].get("content", "") if teacher else ""

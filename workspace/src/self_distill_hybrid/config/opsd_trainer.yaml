@@ -151,6 +151,14 @@ opsd:
   # Tokens reserved for rescue generation when Turn 2 is truncated.
   # Phase 1 gets (epiphany_max_tokens - epiphany_rescue_tokens), phase 2 gets this.
   epiphany_rescue_tokens: 1024
+  # Max tokens from the epiphany memo to inject into the teacher prompt.
+  # Only the first N tokens (decoded back to text) are used as teacher context.
+  # null = use the full epiphany (no truncation).
+  epiphany_teacher_ctx_tokens: null
+
+  # Path to expert demonstrations parquet for Turn 2 prompts.
+  # null = disabled (templates must not use {expert_demonstration}).
+  expert_demo_path: null
 
 # ---------- Reward model (disabled for OPSD) ----------
 reward_model:

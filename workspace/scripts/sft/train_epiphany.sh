@@ -28,6 +28,8 @@
 SD_MAX_TOKENS=8192
 EPIPHANY_MAX_TOKENS=8192
 EPIPHANY_RESCUE_TOKENS=2048
+EPIPHANY_TEACHER_CTX_TOKENS=null
+EXPERT_DEMO_PATH=${EXPERT_DEMO_PATH:-./workspace/data/expert_demonstrations/expert_demos_3200.parquet}
 
 MODEL_PATH=${MODEL_PATH:?MODEL_PATH environment variable is required} \
 SD_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts.parquet \
@@ -63,4 +65,6 @@ RL_VAL_FILES="['./workspace/data/processed/val_math500.parquet', './workspace/da
 bash workspace/scripts/sft/train_opsd.sh \
     opsd.use_epiphany=true \
     opsd.epiphany_max_tokens=$EPIPHANY_MAX_TOKENS \
-    opsd.epiphany_rescue_tokens=$EPIPHANY_RESCUE_TOKENS
+    opsd.epiphany_rescue_tokens=$EPIPHANY_RESCUE_TOKENS \
+    opsd.epiphany_teacher_ctx_tokens=$EPIPHANY_TEACHER_CTX_TOKENS \
+    opsd.expert_demo_path="$EXPERT_DEMO_PATH"
