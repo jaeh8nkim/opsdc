@@ -470,10 +470,19 @@ class AgentLoopWorkerBase:
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
+        # If validation overrides max_new_tokens, propagate as _response_length
+        # so postprocessing allocates a large enough output buffer.
+        if "max_new_tokens" in batch.meta_info:
+            _response_length_override = int(batch.meta_info["max_new_tokens"])
+        else:
+            _response_length_override = None
+
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            if _response_length_override is not None:
+                kwargs["_response_length"] = _response_length_override
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -552,6 +561,10 @@ class AgentLoopWorkerBase:
             self.config.actor_rollout_ref.rollout.prompt_length,
         ))
         prompt_length = max(prompt_length, len(output.prompt_ids))
+        response_length = int(kwargs.get(
+            "_response_length",
+            self.config.actor_rollout_ref.rollout.response_length,
+        ))
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
@@ -568,7 +581,7 @@ class AgentLoopWorkerBase:
         response_output = self.tokenizer.pad(
             {"input_ids": output.response_ids},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            max_length=response_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -579,7 +592,7 @@ class AgentLoopWorkerBase:
         response_mask_output = self.tokenizer.pad(
             {"input_ids": output.response_mask},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            max_length=response_length,
             return_tensors="pt",
             return_attention_mask=False,
         )
@@ -588,7 +601,7 @@ class AgentLoopWorkerBase:
 
         response_logprobs = None
         if output.response_logprobs is not None:
-            pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
+            pad_size = response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]

@@ -208,6 +208,23 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
 
+    # GRPO group signal quality: fraction of prompts with mixed correct/incorrect responses
+    index = batch.non_tensor_batch.get("uid", batch.non_tensor_batch.get("index", None))
+    if index is not None:
+        scores_per_sample = non_aborted_sequence_score
+        id2scores = defaultdict(list)
+        for i in range(len(index)):
+            if non_aborted_mask[i]:
+                id2scores[index[i]].append(scores_per_sample[i].item())
+        if id2scores:
+            group_pass_rates = []
+            for idx, sc in id2scores.items():
+                n_correct = sum(1 for s in sc if s > 0.5)
+                group_pass_rates.append(n_correct / len(sc))
+            n_mixed = sum(1 for r in group_pass_rates if 0 < r < 1)
+            metrics["grpo/frac_mixed"] = n_mixed / len(group_pass_rates)
+            metrics["grpo/mean_group_pass_rate"] = sum(group_pass_rates) / len(group_pass_rates)
+
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:
         num_turns = batch.non_tensor_batch["__num_turns__"]

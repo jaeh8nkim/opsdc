@@ -659,6 +659,11 @@ class RayPPOTrainer:
                 "validate": True,
                 "global_steps": self.global_steps,
             }
+            # Allow overriding response length for validation via trainer config
+            from omegaconf import OmegaConf
+            val_max_response_length = OmegaConf.select(self.config, "trainer.val_max_response_length", default=None)
+            if val_max_response_length is not None:
+                test_gen_batch.meta_info["max_new_tokens"] = int(val_max_response_length)
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
