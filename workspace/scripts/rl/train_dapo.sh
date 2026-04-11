@@ -55,20 +55,20 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-5}
 # =============================================================================
 # Batch sizes
 # =============================================================================
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-32}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-256}
 # gen_batch_size > train_batch_size gives headroom for group filtering.
 # Official DAPO uses 3x; with filtering on, some groups get dropped.
 GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-$((TRAIN_BATCH_SIZE * 3))}
-N=${N:-16}
+N=${N:-8}
 MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-16}
 MICRO_BATCH_SIZE_PER_GPU=${MICRO_BATCH_SIZE_PER_GPU:-1}
 
 # =============================================================================
 # Optimizer
 # =============================================================================
-LEARNING_RATE=${LEARNING_RATE:-1e-5}
+LEARNING_RATE=${LEARNING_RATE:-1e-6}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.1}
-WARMUP_STEPS=${WARMUP_STEPS:-5}
+WARMUP_STEPS=${WARMUP_STEPS:-10}
 GRAD_CLIP=${GRAD_CLIP:-1.0}
 
 # =============================================================================

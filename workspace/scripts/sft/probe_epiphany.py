@@ -202,8 +202,11 @@ def show_summary(log_path):
             print(H)
             print("-" * len(H))
 
-            for d in val_steps:
+            first_train_step = int(train_steps[0].get("step", 0)) if train_steps else None
+            for i, d in enumerate(val_steps):
                 step = int(d.get("step", 0))
+                if i == 0 and first_train_step is not None and step == first_train_step:
+                    step = 0
                 row = f"{step:5d}"
                 for bm, n in benchmarks:
                     acc = d.get(f"val-core/{bm}/acc/mean@{n}", 0)
