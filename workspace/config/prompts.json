@@ -45,6 +45,9 @@
     "epiphany_turn2_correct": {
         "template": "The solution is correct. The correct answer is: {ground_truth}\n\nYour solution worked. Write a memo reinforcing what you did right. What is the key insight that made this problem tractable? What is the most efficient path through the solution? What patterns or structural features should you recognize on sight so you can solve similar problems just as well?"
     },
+    "epiphany_turn2_truncated": {
+        "template": "Your solution ran out of space before finishing. The correct answer is: {ground_truth}\n\nWrite a memo about how to solve this more efficiently. What is the key insight that makes the problem tractable? What is the most direct path through the solution? What patterns or structural features should you recognize on sight so you can reach the answer without running out of space?"
+    },
     "epiphany_teacher": {
         "prefix": "You recall the following from studying similar problems:\n\n",
         "suffix": "\n\nNow use what you recall to solve the following problem correctly and efficiently."

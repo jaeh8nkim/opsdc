@@ -29,6 +29,12 @@ SD_MAX_TOKENS=8192
 EPIPHANY_MAX_TOKENS=8192
 EPIPHANY_RESCUE_TOKENS=2048
 EPIPHANY_TEACHER_CTX_TOKENS=null
+# KL_GATING options:
+#   all                    — KL on every sample
+#   correct_only           — KL only on correct rollouts
+#   correct_and_truncated  — KL on correct + truncated rollouts
+#   incorrect_only         — KL only on incorrect rollouts
+KL_GATING=${KL_GATING:-all}
 EXPERT_DEMO_PATH=${EXPERT_DEMO_PATH:-./workspace/data/expert_demonstrations/expert_demos_3200.parquet}
 
 MODEL_PATH=${MODEL_PATH:?MODEL_PATH environment variable is required} \
@@ -67,4 +73,5 @@ bash workspace/scripts/sft/train_opsd.sh \
     opsd.epiphany_max_tokens=$EPIPHANY_MAX_TOKENS \
     opsd.epiphany_rescue_tokens=$EPIPHANY_RESCUE_TOKENS \
     opsd.epiphany_teacher_ctx_tokens=$EPIPHANY_TEACHER_CTX_TOKENS \
-    opsd.expert_demo_path="$EXPERT_DEMO_PATH"
+    opsd.expert_demo_path="$EXPERT_DEMO_PATH" \
+    opsd.kl_gating=$KL_GATING

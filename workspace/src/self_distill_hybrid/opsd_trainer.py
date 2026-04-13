@@ -106,6 +106,10 @@ class OPSDTrainer:
         self.test_freq = self.opsd_config.get("test_freq", 10)
         self.log_freq = self.opsd_config.get("log_freq", 5)
         self.teacher_update_freq = self.opsd_config.get("teacher_update_freq", 0) or 0
+        self.kl_gating = self.opsd_config.get("kl_gating", "all")
+        assert self.kl_gating in (
+            "all", "correct_only", "correct_and_truncated", "incorrect_only",
+        ), f"Invalid kl_gating mode: {self.kl_gating}"
 
         # Detailed logging
         self.log_dir = self.opsd_config.get(
@@ -745,6 +749,25 @@ class OPSDTrainer:
                 metrics["sd/truncation_rate"] = _n_truncated / max(1, batch_size)
                 metrics["sd/n_truncated"] = _n_truncated
 
+                # ---- KL gating mask ----
+                truncated_mask = [
+                    student_token_counts[i] >= _gen_cap
+                    for i in range(batch_size)
+                ]
+                if self.kl_gating == "all":
+                    kl_mask = [True] * batch_size
+                elif self.kl_gating == "correct_only":
+                    kl_mask = list(correct_mask)
+                elif self.kl_gating == "incorrect_only":
+                    kl_mask = [not c for c in correct_mask]
+                else:  # correct_and_truncated
+                    kl_mask = [
+                        correct_mask[i] or truncated_mask[i]
+                        for i in range(batch_size)
+                    ]
+                n_kl_samples = sum(kl_mask)
+                metrics["sd/n_kl_samples"] = n_kl_samples
+
                 teacher_solutions = list(batch.non_tensor_batch.get("teacher_solution", []))
                 if teacher_solutions:
                     teacher_lens = [len(t) for t in teacher_solutions]
@@ -759,14 +782,17 @@ class OPSDTrainer:
                     epiphanies, raw_turn2_outputs, rescue_meta = (
                         self._generate_epiphanies(
                             batch, responses, correct_mask,
+                            kl_mask=kl_mask,
+                            truncated_mask=truncated_mask,
                         )
                     )
                     epiphany_time = time.time() - epiphany_t0
                     metrics["timing/epiphany_s"] = epiphany_time
 
-                    # Turn 2 token metrics (on stitched outputs)
+                    # Turn 2 token metrics (on active stitched outputs only)
                     epi_token_lens = [
-                        len(self.tokenizer.encode(r)) for r in raw_turn2_outputs
+                        len(self.tokenizer.encode(r))
+                        for r in raw_turn2_outputs if r
                     ]
                     epiphany_max_tokens = int(
                         self.opsd_config.get("epiphany_max_tokens", 2048)
@@ -804,13 +830,22 @@ class OPSDTrainer:
                         "n_rescued", 0
                     )
 
-                # ---- Phase 3: Train (OPSD JSD on ALL responses) ----
-                train_t0 = time.time()
-                opsd_metrics = self._opsd_update(batch, responses, epiphanies=epiphanies)
-                train_time = time.time() - train_t0
-
-                metrics.update(opsd_metrics)
-                metrics["timing/train_s"] = train_time
+                # ---- Phase 3: Train (OPSD on KL-gated samples) ----
+                if n_kl_samples == 0:
+                    py_logger.info(
+                        "Step %d: No KL-active samples — skipping OPSD update",
+                        self.global_steps,
+                    )
+                    opsd_metrics = {"opsd/loss": 0.0, "opsd/skipped": 1.0, "opsd/n_samples": 0}
+                    metrics.update(opsd_metrics)
+                else:
+                    train_t0 = time.time()
+                    opsd_metrics = self._opsd_update(
+                        batch, responses, epiphanies=epiphanies, kl_mask=kl_mask,
+                    )
+                    train_time = time.time() - train_t0
+                    metrics.update(opsd_metrics)
+                    metrics["timing/train_s"] = train_time
 
                 # ---- Teacher weight update (if configured) ----
                 if self.teacher_update_freq > 0 and self.global_steps % self.teacher_update_freq == 0:
@@ -821,7 +856,7 @@ class OPSDTrainer:
 
                 epoch_metrics["epoch/total_generated"] += batch_size
                 epoch_metrics["epoch/total_correct"] += n_correct
-                epoch_metrics["epoch/total_trained"] += batch_size  # ALL responses trained
+                epoch_metrics["epoch/total_trained"] += n_kl_samples
                 epoch_metrics["epoch/steps"] += 1
 
                 # ---- Log samples ----
@@ -831,6 +866,7 @@ class OPSDTrainer:
                         self._log_epiphany_samples(
                             batch, responses, correct_mask, predictions,
                             epiphanies, raw_turn2_outputs, rescue_meta,
+                            kl_mask=kl_mask, truncated_mask=truncated_mask,
                         )
 
                 # ---- Phase 4: Validation ----
@@ -953,6 +989,8 @@ class OPSDTrainer:
         original_batch: DataProto,
         responses: list[str],
         correct_mask: list[bool],
+        kl_mask: list[bool] | None = None,
+        truncated_mask: list[bool] | None = None,
     ) -> tuple[list[str], list[str], dict]:
         """Generate Turn 2 epiphany memos via self-reflection.
 
@@ -969,13 +1007,41 @@ class OPSDTrainer:
         the <think> block first (if truncated mid-reasoning) or continuing
         the study notes (if truncated mid-notes).
 
+        When ``kl_mask`` is provided, only generates epiphanies for active
+        (True) samples. Inactive samples get empty strings. This saves
+        Turn 2 generation compute when correctness-gated KL is enabled.
+
+        Args:
+            kl_mask: Per-sample mask — True = generate epiphany, False = skip.
+            truncated_mask: Per-sample flag — True = Turn 1 hit token budget.
+                Used to select the truncated Turn 2 template.
+
         Returns:
             (epiphanies, raw_turn2_outputs, rescue_meta) — stripped memos,
-            raw generations, and rescue metadata dict.
+            raw generations, and rescue metadata dict. Inactive samples get
+            empty strings in both lists.
         """
+        batch_size = len(responses)
+        empty_rescue_meta = {
+            "n_rescued": 0, "rescued_indices": set(), "rescue_token_lens": [],
+        }
+
+        # Determine which samples to generate epiphanies for
+        if kl_mask is not None:
+            active_indices = [i for i in range(batch_size) if kl_mask[i]]
+        else:
+            active_indices = list(range(batch_size))
+        n_active = len(active_indices)
+
+        if n_active == 0:
+            return [""] * batch_size, [""] * batch_size, empty_rescue_meta
+
         prompts_cfg = self._get_prompt_config()
         turn2_correct = prompts_cfg["epiphany_turn2_correct"]["template"]
         turn2_incorrect = prompts_cfg["epiphany_turn2_incorrect"]["template"]
+        turn2_truncated = prompts_cfg.get(
+            "epiphany_turn2_truncated", {},
+        ).get("template", turn2_incorrect)
 
         sft_prompts = list(original_batch.non_tensor_batch["sft_prompt"])
         ground_truths = list(original_batch.non_tensor_batch["ground_truth"])
@@ -985,18 +1051,17 @@ class OPSDTrainer:
         rescue_tokens = int(self.opsd_config.get("epiphany_rescue_tokens", 1024))
         phase1_budget = epiphany_max_tokens - rescue_tokens
 
-        batch_size = len(responses)
-        turn2_raw_prompts = np.empty(batch_size, dtype=object)
+        turn2_raw_prompts = np.empty(n_active, dtype=object)
 
-        for i in range(batch_size):
+        for j, orig_i in enumerate(active_indices):
             # Parse original question from sft_prompt
-            sft_msgs = json.loads(sft_prompts[i])
+            sft_msgs = json.loads(sft_prompts[orig_i])
             original_user_content = sft_msgs[0]["content"]
 
             # Look up expert demonstration if available
-            format_kwargs = {"ground_truth": ground_truths[i]}
+            format_kwargs = {"ground_truth": ground_truths[orig_i]}
             if self.expert_demos is not None:
-                q = questions[i]
+                q = questions[orig_i]
                 if q not in self.expert_demos:
                     raise KeyError(
                         f"Expert demonstration not found for question: {q[:100]}... "
@@ -1004,26 +1069,28 @@ class OPSDTrainer:
                     )
                 format_kwargs["expert_demonstration"] = self.expert_demos[q]
 
-            # Build Turn 2 instruction based on correctness
-            if correct_mask[i]:
+            # Build Turn 2 instruction: correct > truncated > incorrect
+            if correct_mask[orig_i]:
                 turn2_content = turn2_correct.format(**format_kwargs)
+            elif truncated_mask is not None and truncated_mask[orig_i]:
+                turn2_content = turn2_truncated.format(**format_kwargs)
             else:
                 turn2_content = turn2_incorrect.format(**format_kwargs)
 
             # Multi-turn conversation
-            turn2_raw_prompts[i] = [
+            turn2_raw_prompts[j] = [
                 {"role": "user", "content": original_user_content},
-                {"role": "assistant", "content": responses[i]},
+                {"role": "assistant", "content": responses[orig_i]},
                 {"role": "user", "content": turn2_content},
             ]
 
         # Build DataProto for Turn 2 generation (phase 1)
         turn2_batch = DataProto.from_single_dict({
-            "dummy_tensor": torch.zeros(batch_size, 1, dtype=torch.uint8),
+            "dummy_tensor": torch.zeros(n_active, 1, dtype=torch.uint8),
         })
         turn2_batch.non_tensor_batch["raw_prompt"] = turn2_raw_prompts
         turn2_batch.non_tensor_batch["uid"] = np.array(
-            [str(uuid.uuid4()) for _ in range(batch_size)], dtype=object,
+            [str(uuid.uuid4()) for _ in range(n_active)], dtype=object,
         )
         turn2_batch.meta_info["global_steps"] = self.global_steps
         turn2_batch.meta_info["max_new_tokens"] = phase1_budget
@@ -1038,17 +1105,17 @@ class OPSDTrainer:
         turn2_output = self.async_rollout_manager.generate_sequences(turn2_batch_padded)
         turn2_output = unpad_dataproto(turn2_output, pad_size=pad_size)
 
-        # Decode Turn 2 responses
+        # Decode Turn 2 responses (active subset)
         prompt_length = turn2_output.batch["prompts"].shape[1]
-        raw_turn2_outputs = []
-        epiphanies = []
-        for i in range(batch_size):
-            response_ids = turn2_output.batch["responses"][i]
-            resp_attn_mask = turn2_output.batch["attention_mask"][i, prompt_length:]
+        active_raw_outputs = []
+        active_epiphanies = []
+        for j in range(n_active):
+            response_ids = turn2_output.batch["responses"][j]
+            resp_attn_mask = turn2_output.batch["attention_mask"][j, prompt_length:]
             valid_ids = response_ids[resp_attn_mask.bool()]
             raw_text = self.tokenizer.decode(valid_ids, skip_special_tokens=True)
-            raw_turn2_outputs.append(raw_text)
-            epiphanies.append(self._strip_think_block(raw_text))
+            active_raw_outputs.append(raw_text)
+            active_epiphanies.append(self._strip_think_block(raw_text))
 
         # ------------------------------------------------------------------
         # Rescue phase: continue truncated generations at the token level
@@ -1057,33 +1124,35 @@ class OPSDTrainer:
             "\n</think>\n", add_special_tokens=False,
         )
 
-        rescue_indices = []  # list of (batch_idx, rescue_type)
+        rescue_indices = []  # list of (active_j, rescue_type)
         rescue_prompt_ids = []
-        rescued_set = set()
+        rescued_active_set = set()
 
-        for i in range(batch_size):
-            token_len = len(self.tokenizer.encode(raw_turn2_outputs[i]))
+        for j in range(n_active):
+            token_len = len(self.tokenizer.encode(active_raw_outputs[j]))
             if token_len < phase1_budget - 1:
                 continue  # completed naturally
 
             # Get original prompt + response token IDs from phase 1.
             # prompts are left-padded — strip padding via attention mask.
-            prompt_mask = turn2_output.batch["attention_mask"][i, :prompt_length]
-            orig_prompt = turn2_output.batch["prompts"][i][prompt_mask.bool()].tolist()
-            resp_ids = turn2_output.batch["responses"][i]
-            resp_mask = turn2_output.batch["attention_mask"][i, prompt_length:]
+            prompt_mask = turn2_output.batch["attention_mask"][j, :prompt_length]
+            orig_prompt = turn2_output.batch["prompts"][j][prompt_mask.bool()].tolist()
+            resp_ids = turn2_output.batch["responses"][j]
+            resp_mask = turn2_output.batch["attention_mask"][j, prompt_length:]
             valid_resp = resp_ids[resp_mask.bool()].tolist()
 
-            if "</think>" not in raw_turn2_outputs[i]:
+            if "</think>" not in active_raw_outputs[j]:
                 # Truncated inside <think> — force-close, then generate notes
                 rescue_prompt_ids.append(orig_prompt + valid_resp + think_close_ids)
-                rescue_indices.append((i, "think_truncated"))
+                rescue_indices.append((j, "think_truncated"))
             else:
                 # Truncated during study notes — continue as-is
                 rescue_prompt_ids.append(orig_prompt + valid_resp)
-                rescue_indices.append((i, "notes_truncated"))
-            rescued_set.add(i)
+                rescue_indices.append((j, "notes_truncated"))
+            rescued_active_set.add(j)
 
+        # Map rescued indices back to original batch indices
+        rescued_set = {active_indices[j] for j in rescued_active_set}
         rescue_meta = {
             "n_rescued": len(rescue_indices),
             "rescued_indices": rescued_set,
@@ -1107,7 +1176,7 @@ class OPSDTrainer:
                 [max_rescue_len] * n_rescue, dtype=object,
             )
             rescue_batch.non_tensor_batch["raw_prompt"] = np.array(
-                [turn2_raw_prompts[idx] for idx, _ in rescue_indices],
+                [turn2_raw_prompts[j] for j, _ in rescue_indices],
                 dtype=object,
             )
             rescue_batch.non_tensor_batch["uid"] = np.array(
@@ -1124,13 +1193,13 @@ class OPSDTrainer:
             )
             rescue_output = unpad_dataproto(rescue_output, pad_size=rescue_pad)
 
-            # Decode rescue outputs and stitch into raw_turn2_outputs
+            # Decode rescue outputs and stitch into active outputs
             rescue_prompt_len = rescue_output.batch["prompts"].shape[1]
             rescue_token_lens = []
-            for j, (idx, rescue_type) in enumerate(rescue_indices):
-                resp_ids = rescue_output.batch["responses"][j]
+            for k, (j, rescue_type) in enumerate(rescue_indices):
+                resp_ids = rescue_output.batch["responses"][k]
                 resp_mask = rescue_output.batch["attention_mask"][
-                    j, rescue_prompt_len:
+                    k, rescue_prompt_len:
                 ]
                 valid = resp_ids[resp_mask.bool()]
                 rescue_text = self.tokenizer.decode(
@@ -1139,45 +1208,72 @@ class OPSDTrainer:
                 rescue_token_lens.append(len(valid))
 
                 if rescue_type == "think_truncated":
-                    raw_turn2_outputs[idx] = (
-                        raw_turn2_outputs[idx] + "\n</think>\n" + rescue_text
+                    active_raw_outputs[j] = (
+                        active_raw_outputs[j] + "\n</think>\n" + rescue_text
                     )
                 else:
-                    raw_turn2_outputs[idx] = (
-                        raw_turn2_outputs[idx] + rescue_text
+                    active_raw_outputs[j] = (
+                        active_raw_outputs[j] + rescue_text
                     )
 
-                epiphanies[idx] = self._strip_think_block(raw_turn2_outputs[idx])
+                active_epiphanies[j] = self._strip_think_block(active_raw_outputs[j])
 
             rescue_meta["rescue_token_lens"] = rescue_token_lens
             logger.info(
-                "Epiphany rescue: %d/%d samples continued "
+                "Epiphany rescue: %d/%d active samples continued "
                 "(phase1_budget=%d, rescue_budget=%d)",
-                n_rescue, batch_size, phase1_budget, rescue_tokens,
+                n_rescue, n_active, phase1_budget, rescue_tokens,
             )
 
-        return epiphanies, raw_turn2_outputs, rescue_meta
+        # Scatter active results back into full-size lists
+        full_epiphanies = [""] * batch_size
+        full_raw_outputs = [""] * batch_size
+        for j, orig_i in enumerate(active_indices):
+            full_epiphanies[orig_i] = active_epiphanies[j]
+            full_raw_outputs[orig_i] = active_raw_outputs[j]
+
+        return full_epiphanies, full_raw_outputs, rescue_meta
 
     # ------------------------------------------------------------------
     # Phase 3: OPSD Update
     # ------------------------------------------------------------------
 
-    def _opsd_update(self, original_batch: DataProto, responses: list[str], epiphanies: list[str] = None) -> dict:
+    def _opsd_update(
+        self,
+        original_batch: DataProto,
+        responses: list[str],
+        epiphanies: list[str] = None,
+        kl_mask: list[bool] | None = None,
+    ) -> dict:
         """Build OPSD batch and dispatch JSD training to workers.
 
-        Trains on ALL responses (no correctness filtering).
+        When ``kl_mask`` is provided, only KL-active samples are included
+        in the training batch. Inactive samples are filtered out before
+        batch construction, saving both teacher forward pass and gradient
+        computation.
 
         Args:
             original_batch: Original batch with sd_prompt and sft_prompt.
-            responses: ALL student-generated response strings.
+            responses: Student-generated response strings.
             epiphanies: Optional list of stripped epiphany memos. When provided
                 and ``use_epiphany`` is enabled, teacher prompts are constructed
                 on-the-fly: [question] + [recall prefix] + [epiphany] + [suffix].
+            kl_mask: Per-sample mask — True = include in training, False = skip.
 
         Returns:
             Dictionary of training metrics.
         """
         student_prompts = list(original_batch.non_tensor_batch["sft_prompt"])
+        sd_prompts = list(original_batch.non_tensor_batch["sd_prompt"])
+
+        # Filter to KL-active samples only
+        if kl_mask is not None:
+            active = [i for i, m in enumerate(kl_mask) if m]
+            student_prompts = [student_prompts[i] for i in active]
+            sd_prompts = [sd_prompts[i] for i in active]
+            responses = [responses[i] for i in active]
+            if epiphanies is not None:
+                epiphanies = [epiphanies[i] for i in active]
 
         if epiphanies is not None and self.opsd_config.get("use_epiphany", False):
             # Build teacher prompts dynamically from epiphanies
@@ -1203,7 +1299,7 @@ class OPSDTrainer:
                 )
                 teacher_prompts.append(json.dumps([{"role": "user", "content": content}]))
         else:
-            teacher_prompts = list(original_batch.non_tensor_batch["sd_prompt"])
+            teacher_prompts = sd_prompts
 
         opsd_batch = build_opsd_batch(
             teacher_prompts=teacher_prompts,
@@ -1332,6 +1428,8 @@ class OPSDTrainer:
         epiphanies: list[str],
         raw_turn2_outputs: list[str],
         rescue_meta: dict | None = None,
+        kl_mask: list[bool] | None = None,
+        truncated_mask: list[bool] | None = None,
     ):
         """Log full epiphany pipeline trace: Turn 1 in/out, Turn 2 in/out, teacher input."""
         n_log = min(self.log_sample_count, len(responses))
@@ -1345,6 +1443,9 @@ class OPSDTrainer:
         epiphany_cfg = prompts_cfg["epiphany_teacher"]
         turn2_correct = prompts_cfg["epiphany_turn2_correct"]["template"]
         turn2_incorrect = prompts_cfg["epiphany_turn2_incorrect"]["template"]
+        turn2_truncated = prompts_cfg.get(
+            "epiphany_turn2_truncated", {},
+        ).get("template", turn2_incorrect)
 
         rescued_set = (
             rescue_meta.get("rescued_indices", set()) if rescue_meta else set()
@@ -1372,6 +1473,8 @@ class OPSDTrainer:
 
             if correct_mask[i]:
                 turn2_user_content = turn2_correct.format(**format_kwargs)
+            elif truncated_mask is not None and truncated_mask[i]:
+                turn2_user_content = turn2_truncated.format(**format_kwargs)
             else:
                 turn2_user_content = turn2_incorrect.format(**format_kwargs)
 
@@ -1393,6 +1496,7 @@ class OPSDTrainer:
             sample = {
                 "sample_idx": i,
                 "is_correct": bool(correct_mask[i]),
+                "kl_active": bool(kl_mask[i]) if kl_mask is not None else True,
                 "ground_truth": gt,
                 "prediction": str(predictions[i]),
                 "rescued": i in rescued_set,

@@ -160,6 +160,10 @@ opsd:
   # null = disabled (templates must not use {expert_demonstration}).
   expert_demo_path: null
 
+  # Which samples receive KL signal:
+  #   "all" (default), "correct_only", "correct_and_truncated", "incorrect_only"
+  kl_gating: all
+
 # ---------- Reward model (disabled for OPSD) ----------
 reward_model:
   enable: false
