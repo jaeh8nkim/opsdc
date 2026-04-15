@@ -141,20 +141,24 @@ opsd:
   # If null, falls back to <checkpoint_dir>/detailed_logs.
   detailed_log_dir: null
 
-  # Epiphany (self-reflection) mode: after student generates (Turn 1),
-  # generate a self-reflection memo (Turn 2) and inject it into the
-  # teacher's prompt as informational advantage for JSD training.
-  use_epiphany: false
+  # Teacher context source for OPSD JSD training:
+  #   "sd_prompt"          — use precomputed sd_prompt from dataset (no Turn 2)
+  #   "reflection_from_gt" — Turn 2 self-reflection memo, wrapped in
+  #                          reflection_from_gt_teacher prefix/suffix
+  #   "gt_directly"        — ground truth wrapped in gt_directly_teacher
+  #                          prefix/suffix (no Turn 2)
+  teacher_ctx_mode: sd_prompt
 
-  # Max tokens for Turn 2 epiphany generation (includes <think> block).
-  epiphany_max_tokens: 2048
+  # ---- Turn 2 generation knobs (used by modes that run Turn 2) ----
+  # Max tokens for Turn 2 generation (includes <think> block).
+  turn2_max_tokens: 2048
   # Tokens reserved for rescue generation when Turn 2 is truncated.
-  # Phase 1 gets (epiphany_max_tokens - epiphany_rescue_tokens), phase 2 gets this.
-  epiphany_rescue_tokens: 1024
-  # Max tokens from the epiphany memo to inject into the teacher prompt.
+  # Phase 1 gets (turn2_max_tokens - turn2_rescue_tokens), phase 2 gets this.
+  turn2_rescue_tokens: 1024
+  # Max tokens from the Turn 2 output to inject into the teacher prompt.
   # Only the first N tokens (decoded back to text) are used as teacher context.
-  # null = use the full epiphany (no truncation).
-  epiphany_teacher_ctx_tokens: null
+  # null = use the full Turn 2 output (no truncation).
+  turn2_teacher_ctx_tokens: null
 
   # Path to expert demonstrations parquet for Turn 2 prompts.
   # null = disabled (templates must not use {expert_demonstration}).

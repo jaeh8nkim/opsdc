@@ -43,6 +43,12 @@ from .sd_verifier import build_opsd_batch, build_sft_batch, verify_batch
 py_logger = logging.getLogger(__name__)
 
 
+# Teacher context modes — see opsd_trainer.yaml::opsd.teacher_ctx_mode for semantics.
+TEACHER_CTX_MODES = frozenset({"sd_prompt", "reflection_from_gt", "gt_directly"})
+# Subset that requires a Turn 2 generation pass before the OPSD update.
+MODES_NEEDING_TURN2 = frozenset({"reflection_from_gt"})
+
+
 class OPSDTrainer:
     """OPSD trainer: JSD-based on-policy self-distillation.
 
@@ -110,6 +116,11 @@ class OPSDTrainer:
         assert self.kl_gating in (
             "all", "correct_only", "correct_and_truncated", "incorrect_only",
         ), f"Invalid kl_gating mode: {self.kl_gating}"
+        self.teacher_ctx_mode = self.opsd_config.get("teacher_ctx_mode", "sd_prompt")
+        assert self.teacher_ctx_mode in TEACHER_CTX_MODES, (
+            f"Invalid teacher_ctx_mode: {self.teacher_ctx_mode} "
+            f"(expected one of {sorted(TEACHER_CTX_MODES)})"
+        )
 
         # Detailed logging
         self.log_dir = self.opsd_config.get(
@@ -773,11 +784,11 @@ class OPSDTrainer:
                     teacher_lens = [len(t) for t in teacher_solutions]
                     metrics["sd/avg_teacher_response_len"] = sum(teacher_lens) / max(1, len(teacher_lens))
 
-                # ---- Phase 2.5: Generate epiphanies (if enabled) ----
+                # ---- Phase 2.5: Generate Turn 2 (if mode requires it) ----
                 epiphanies = None
                 raw_turn2_outputs = None
                 rescue_meta = None
-                if self.opsd_config.get("use_epiphany", False):
+                if self.teacher_ctx_mode in MODES_NEEDING_TURN2:
                     epiphany_t0 = time.time()
                     epiphanies, raw_turn2_outputs, rescue_meta = (
                         self._generate_epiphanies(
@@ -794,11 +805,11 @@ class OPSDTrainer:
                         len(self.tokenizer.encode(r))
                         for r in raw_turn2_outputs if r
                     ]
-                    epiphany_max_tokens = int(
-                        self.opsd_config.get("epiphany_max_tokens", 2048)
+                    turn2_max_tokens = int(
+                        self.opsd_config.get("turn2_max_tokens", 2048)
                     )
                     rescue_tokens = int(
-                        self.opsd_config.get("epiphany_rescue_tokens", 1024)
+                        self.opsd_config.get("turn2_rescue_tokens", 1024)
                     )
                     metrics["epiphany/avg_tokens"] = (
                         sum(epi_token_lens) / max(1, len(epi_token_lens))
@@ -820,7 +831,7 @@ class OPSDTrainer:
                             rescue_j += 1
                         else:
                             # Non-rescued: clipped if hit total budget
-                            if tl >= epiphany_max_tokens - 1:
+                            if tl >= turn2_max_tokens - 1:
                                 n_clipped += 1
                     metrics["epiphany/clip_pct"] = n_clipped / max(
                         1, len(epi_token_lens)
@@ -862,12 +873,11 @@ class OPSDTrainer:
                 # ---- Log samples ----
                 if self.global_steps % self.log_freq == 0:
                     self._log_rollout_samples(batch, responses, correct_mask, predictions)
-                    if epiphanies is not None:
-                        self._log_epiphany_samples(
-                            batch, responses, correct_mask, predictions,
-                            epiphanies, raw_turn2_outputs, rescue_meta,
-                            kl_mask=kl_mask, truncated_mask=truncated_mask,
-                        )
+                    self._log_epiphany_samples(
+                        batch, responses, correct_mask, predictions,
+                        epiphanies, raw_turn2_outputs, rescue_meta,
+                        kl_mask=kl_mask, truncated_mask=truncated_mask,
+                    )
 
                 # ---- Phase 4: Validation ----
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -1037,19 +1047,19 @@ class OPSDTrainer:
             return [""] * batch_size, [""] * batch_size, empty_rescue_meta
 
         prompts_cfg = self._get_prompt_config()
-        turn2_correct = prompts_cfg["epiphany_turn2_correct"]["template"]
-        turn2_incorrect = prompts_cfg["epiphany_turn2_incorrect"]["template"]
+        turn2_correct = prompts_cfg["reflection_from_gt_turn2_correct"]["template"]
+        turn2_incorrect = prompts_cfg["reflection_from_gt_turn2_incorrect"]["template"]
         turn2_truncated = prompts_cfg.get(
-            "epiphany_turn2_truncated", {},
+            "reflection_from_gt_turn2_truncated", {},
         ).get("template", turn2_incorrect)
 
         sft_prompts = list(original_batch.non_tensor_batch["sft_prompt"])
         ground_truths = list(original_batch.non_tensor_batch["ground_truth"])
         questions = list(original_batch.non_tensor_batch["question"])
 
-        epiphany_max_tokens = int(self.opsd_config.get("epiphany_max_tokens", 2048))
-        rescue_tokens = int(self.opsd_config.get("epiphany_rescue_tokens", 1024))
-        phase1_budget = epiphany_max_tokens - rescue_tokens
+        turn2_max_tokens = int(self.opsd_config.get("turn2_max_tokens", 2048))
+        rescue_tokens = int(self.opsd_config.get("turn2_rescue_tokens", 1024))
+        phase1_budget = turn2_max_tokens - rescue_tokens
 
         turn2_raw_prompts = np.empty(n_active, dtype=object)
 
@@ -1235,6 +1245,53 @@ class OPSDTrainer:
         return full_epiphanies, full_raw_outputs, rescue_meta
 
     # ------------------------------------------------------------------
+    # Teacher-prompt builders (one per teacher_ctx_mode)
+    # ------------------------------------------------------------------
+
+    def _build_teacher_prompts_reflection_from_gt(
+        self,
+        student_prompts: list[str],
+        epiphanies: list[str],
+    ) -> list[str]:
+        """[question] + [recall prefix] + [Turn 2 memo] + [recall suffix]."""
+        cfg = self._get_prompt_config()["reflection_from_gt_teacher"]
+        ctx_token_limit = self.opsd_config.get("turn2_teacher_ctx_tokens", None)
+        teacher_prompts = []
+        for i in range(len(student_prompts)):
+            memo = epiphanies[i]
+            if ctx_token_limit is not None:
+                token_ids = self.tokenizer.encode(memo)
+                if len(token_ids) > ctx_token_limit:
+                    memo = self.tokenizer.decode(
+                        token_ids[:ctx_token_limit],
+                        skip_special_tokens=True,
+                    )
+            question_content = json.loads(student_prompts[i])[0]["content"]
+            content = (
+                question_content + "\n\n"
+                + cfg["prefix"] + memo + cfg["suffix"]
+            )
+            teacher_prompts.append(json.dumps([{"role": "user", "content": content}]))
+        return teacher_prompts
+
+    def _build_teacher_prompts_gt_directly(
+        self,
+        student_prompts: list[str],
+        ground_truths: list[str],
+    ) -> list[str]:
+        """[question] + [GT prefix] + [ground truth] + [GT suffix]. No Turn 2."""
+        cfg = self._get_prompt_config()["gt_directly_teacher"]
+        teacher_prompts = []
+        for i in range(len(student_prompts)):
+            question_content = json.loads(student_prompts[i])[0]["content"]
+            content = (
+                question_content + "\n\n"
+                + cfg["prefix"] + str(ground_truths[i]) + cfg["suffix"]
+            )
+            teacher_prompts.append(json.dumps([{"role": "user", "content": content}]))
+        return teacher_prompts
+
+    # ------------------------------------------------------------------
     # Phase 3: OPSD Update
     # ------------------------------------------------------------------
 
@@ -1253,11 +1310,10 @@ class OPSDTrainer:
         computation.
 
         Args:
-            original_batch: Original batch with sd_prompt and sft_prompt.
+            original_batch: Original batch with sd_prompt, sft_prompt, ground_truth.
             responses: Student-generated response strings.
-            epiphanies: Optional list of stripped epiphany memos. When provided
-                and ``use_epiphany`` is enabled, teacher prompts are constructed
-                on-the-fly: [question] + [recall prefix] + [epiphany] + [suffix].
+            epiphanies: Optional list of stripped Turn 2 memos (only populated
+                when teacher_ctx_mode == "reflection_from_gt").
             kl_mask: Per-sample mask — True = include in training, False = skip.
 
         Returns:
@@ -1265,41 +1321,28 @@ class OPSDTrainer:
         """
         student_prompts = list(original_batch.non_tensor_batch["sft_prompt"])
         sd_prompts = list(original_batch.non_tensor_batch["sd_prompt"])
+        ground_truths = list(original_batch.non_tensor_batch["ground_truth"])
 
         # Filter to KL-active samples only
         if kl_mask is not None:
             active = [i for i, m in enumerate(kl_mask) if m]
             student_prompts = [student_prompts[i] for i in active]
             sd_prompts = [sd_prompts[i] for i in active]
+            ground_truths = [ground_truths[i] for i in active]
             responses = [responses[i] for i in active]
             if epiphanies is not None:
                 epiphanies = [epiphanies[i] for i in active]
 
-        if epiphanies is not None and self.opsd_config.get("use_epiphany", False):
-            # Build teacher prompts dynamically from epiphanies
-            epiphany_cfg = self._get_prompt_config()["epiphany_teacher"]
-            ctx_token_limit = self.opsd_config.get("epiphany_teacher_ctx_tokens", None)
-            teacher_prompts = []
-            for i in range(len(responses)):
-                memo = epiphanies[i]
-                if ctx_token_limit is not None:
-                    token_ids = self.tokenizer.encode(memo)
-                    if len(token_ids) > ctx_token_limit:
-                        memo = self.tokenizer.decode(
-                            token_ids[:ctx_token_limit],
-                            skip_special_tokens=True,
-                        )
-                sft_msgs = json.loads(student_prompts[i])
-                question_content = sft_msgs[0]["content"]
-                content = (
-                    question_content + "\n\n"
-                    + epiphany_cfg["prefix"]
-                    + memo
-                    + epiphany_cfg["suffix"]
-                )
-                teacher_prompts.append(json.dumps([{"role": "user", "content": content}]))
-        else:
-            teacher_prompts = sd_prompts
+        builders = {
+            "sd_prompt": lambda: sd_prompts,
+            "reflection_from_gt": lambda: self._build_teacher_prompts_reflection_from_gt(
+                student_prompts, epiphanies,
+            ),
+            "gt_directly": lambda: self._build_teacher_prompts_gt_directly(
+                student_prompts, ground_truths,
+            ),
+        }
+        teacher_prompts = builders[self.teacher_ctx_mode]()
 
         opsd_batch = build_opsd_batch(
             teacher_prompts=teacher_prompts,
@@ -1425,27 +1468,36 @@ class OPSDTrainer:
         responses: list[str],
         correct_mask: list[bool],
         predictions: list[str],
-        epiphanies: list[str],
-        raw_turn2_outputs: list[str],
+        epiphanies: list[str] | None,
+        raw_turn2_outputs: list[str] | None,
         rescue_meta: dict | None = None,
         kl_mask: list[bool] | None = None,
         truncated_mask: list[bool] | None = None,
     ):
-        """Log full epiphany pipeline trace: Turn 1 in/out, Turn 2 in/out, teacher input."""
+        """Log Turn 1 in/out, teacher input, and (when applicable) Turn 2 in/out.
+
+        Runs for every teacher_ctx_mode so the probe can show the exact teacher
+        context. Turn 2 fields are present only when the mode produced one.
+        """
         n_log = min(self.log_sample_count, len(responses))
         if n_log == 0:
             return
 
         sft_prompts = list(batch.non_tensor_batch.get("sft_prompt", []))
+        sd_prompts = list(batch.non_tensor_batch.get("sd_prompt", []))
         ground_truths = list(batch.non_tensor_batch["ground_truth"])
         questions = list(batch.non_tensor_batch["question"])
         prompts_cfg = self._get_prompt_config()
-        epiphany_cfg = prompts_cfg["epiphany_teacher"]
-        turn2_correct = prompts_cfg["epiphany_turn2_correct"]["template"]
-        turn2_incorrect = prompts_cfg["epiphany_turn2_incorrect"]["template"]
-        turn2_truncated = prompts_cfg.get(
-            "epiphany_turn2_truncated", {},
-        ).get("template", turn2_incorrect)
+
+        has_turn2 = epiphanies is not None
+        if has_turn2:
+            reflection_cfg = prompts_cfg["reflection_from_gt_teacher"]
+            turn2_correct = prompts_cfg["reflection_from_gt_turn2_correct"]["template"]
+            turn2_incorrect = prompts_cfg["reflection_from_gt_turn2_incorrect"]["template"]
+            turn2_truncated = prompts_cfg.get(
+                "reflection_from_gt_turn2_truncated", {},
+            ).get("template", turn2_incorrect)
+        gt_directly_cfg = prompts_cfg.get("gt_directly_teacher", {})
 
         rescued_set = (
             rescue_meta.get("rescued_indices", set()) if rescue_meta else set()
@@ -1459,42 +1511,56 @@ class OPSDTrainer:
             except (json.JSONDecodeError, TypeError, IndexError):
                 turn1_input = str(sft_prompts[i]) if i < len(sft_prompts) else ""
 
-            # Turn 2 input (multi-turn conversation)
             sft_msgs = json.loads(sft_prompts[i]) if i < len(sft_prompts) else []
             original_content = sft_msgs[0]["content"] if sft_msgs else ""
             gt = ground_truths[i] if i < len(ground_truths) else ""
 
-            # Format Turn 2 template with expert demo if available
-            format_kwargs = {"ground_truth": gt}
             expert_demo = None
             if self.expert_demos is not None and i < len(questions):
                 expert_demo = self.expert_demos.get(questions[i], "")
-                format_kwargs["expert_demonstration"] = expert_demo
 
-            if correct_mask[i]:
-                turn2_user_content = turn2_correct.format(**format_kwargs)
-            elif truncated_mask is not None and truncated_mask[i]:
-                turn2_user_content = turn2_truncated.format(**format_kwargs)
-            else:
-                turn2_user_content = turn2_incorrect.format(**format_kwargs)
+            # Turn 2 (only when the mode generates one)
+            turn2_input = None
+            if has_turn2:
+                format_kwargs = {"ground_truth": gt}
+                if expert_demo is not None:
+                    format_kwargs["expert_demonstration"] = expert_demo
+                if correct_mask[i]:
+                    turn2_user_content = turn2_correct.format(**format_kwargs)
+                elif truncated_mask is not None and truncated_mask[i]:
+                    turn2_user_content = turn2_truncated.format(**format_kwargs)
+                else:
+                    turn2_user_content = turn2_incorrect.format(**format_kwargs)
+                turn2_input = [
+                    {"role": "user", "content": original_content},
+                    {"role": "assistant", "content": responses[i]},
+                    {"role": "user", "content": turn2_user_content},
+                ]
 
-            turn2_input = [
-                {"role": "user", "content": original_content},
-                {"role": "assistant", "content": responses[i]},
-                {"role": "user", "content": turn2_user_content},
-            ]
-
-            # Teacher input (reconstructed)
-            teacher_content = (
-                original_content + "\n\n"
-                + epiphany_cfg["prefix"]
-                + epiphanies[i]
-                + epiphany_cfg["suffix"]
-            )
-            teacher_input = [{"role": "user", "content": teacher_content}]
+            # Teacher input — exactly what _opsd_update will hand the teacher
+            if self.teacher_ctx_mode == "reflection_from_gt":
+                teacher_content = (
+                    original_content + "\n\n"
+                    + reflection_cfg["prefix"] + epiphanies[i] + reflection_cfg["suffix"]
+                )
+                teacher_input = [{"role": "user", "content": teacher_content}]
+            elif self.teacher_ctx_mode == "gt_directly":
+                teacher_content = (
+                    original_content + "\n\n"
+                    + gt_directly_cfg.get("prefix", "")
+                    + str(gt)
+                    + gt_directly_cfg.get("suffix", "")
+                )
+                teacher_input = [{"role": "user", "content": teacher_content}]
+            else:  # sd_prompt — passthrough from dataset
+                try:
+                    teacher_input = json.loads(sd_prompts[i]) if i < len(sd_prompts) else []
+                except (json.JSONDecodeError, TypeError):
+                    teacher_input = str(sd_prompts[i]) if i < len(sd_prompts) else ""
 
             sample = {
                 "sample_idx": i,
+                "teacher_ctx_mode": self.teacher_ctx_mode,
                 "is_correct": bool(correct_mask[i]),
                 "kl_active": bool(kl_mask[i]) if kl_mask is not None else True,
                 "ground_truth": gt,
@@ -1503,12 +1569,13 @@ class OPSDTrainer:
                 "turn1_input": turn1_input,
                 "turn1_output": responses[i],
                 "turn1_tokens": len(self.tokenizer.encode(responses[i])),
-                "turn2_input": turn2_input,
-                "turn2_output_raw": raw_turn2_outputs[i],
-                "turn2_epiphany": epiphanies[i],
-                "turn2_tokens": len(self.tokenizer.encode(raw_turn2_outputs[i])),
                 "teacher_input": teacher_input,
             }
+            if has_turn2:
+                sample["turn2_input"] = turn2_input
+                sample["turn2_output_raw"] = raw_turn2_outputs[i]
+                sample["turn2_epiphany"] = epiphanies[i]
+                sample["turn2_tokens"] = len(self.tokenizer.encode(raw_turn2_outputs[i]))
             if expert_demo is not None:
                 sample["expert_demonstration"] = expert_demo
             samples.append(sample)

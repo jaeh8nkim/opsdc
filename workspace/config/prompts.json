@@ -39,17 +39,21 @@
         "prefix": "Solve the following math problem correctly using {percent_reduce}% fewer tokens than you normally would. Be more concise — cut unnecessary elaboration, redundant steps, and verbose explanations while preserving correctness.\n\nThe last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n",
         "suffix": "\n\nRemember to put your answer on its own line after \"Answer:\"."
     },
-    "epiphany_turn2_incorrect": {
+    "reflection_from_gt_turn2_incorrect": {
         "template": "The attempted solution is incorrect. The correct answer is: {ground_truth}\n\nStudy the correct answer carefully. Then write a memo for yourself that would help you solve problems like this one in the future. What is the key insight that makes the problem tractable? What patterns or structural features should you recognize on sight? What wrong paths might you go down, and how can you recognize early that you are on a wrong path?"
     },
-    "epiphany_turn2_correct": {
+    "reflection_from_gt_turn2_correct": {
         "template": "The solution is correct. The correct answer is: {ground_truth}\n\nYour solution worked. Write a memo reinforcing what you did right. What is the key insight that made this problem tractable? What is the most efficient path through the solution? What patterns or structural features should you recognize on sight so you can solve similar problems just as well?"
     },
-    "epiphany_turn2_truncated": {
+    "reflection_from_gt_turn2_truncated": {
         "template": "Your solution ran out of space before finishing. The correct answer is: {ground_truth}\n\nWrite a memo about how to solve this more efficiently. What is the key insight that makes the problem tractable? What is the most direct path through the solution? What patterns or structural features should you recognize on sight so you can reach the answer without running out of space?"
     },
-    "epiphany_teacher": {
+    "reflection_from_gt_teacher": {
         "prefix": "You recall the following from studying similar problems:\n\n",
         "suffix": "\n\nNow use what you recall to solve the following problem correctly and efficiently."
+    },
+    "gt_directly_teacher": {
+        "prefix": "The correct answer is:\n\n",
+        "suffix": "\n\nNow solve the following problem correctly and efficiently, arriving at this answer."
     }
 }
