@@ -34,6 +34,7 @@ TEACHER_CTX_MODE=${TEACHER_CTX_MODE:-reflection_from_gt}
 #   sd_prompt          — use precomputed sd_prompt from dataset (no Turn 2)
 #   reflection_from_gt — Turn 2 self-reflection memo as teacher context
 #   gt_directly        — ground truth as teacher context (no Turn 2)
+#   conciseness_instruction — conciseness instruction only (no Turn 2, matches train_opsdc.sh)
 KL_GATING=${KL_GATING:-all}
 # KL_GATING options:
 #   all                    — KL on every sample

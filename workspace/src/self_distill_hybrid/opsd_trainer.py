@@ -44,7 +44,7 @@ py_logger = logging.getLogger(__name__)
 
 
 # Teacher context modes — see opsd_trainer.yaml::opsd.teacher_ctx_mode for semantics.
-TEACHER_CTX_MODES = frozenset({"sd_prompt", "reflection_from_gt", "gt_directly"})
+TEACHER_CTX_MODES = frozenset({"sd_prompt", "reflection_from_gt", "gt_directly", "conciseness_instruction"})
 # Subset that requires a Turn 2 generation pass before the OPSD update.
 MODES_NEEDING_TURN2 = frozenset({"reflection_from_gt"})
 
@@ -1291,6 +1291,23 @@ class OPSDTrainer:
             teacher_prompts.append(json.dumps([{"role": "user", "content": content}]))
         return teacher_prompts
 
+    def _build_teacher_prompts_conciseness_instruction(
+        self,
+        student_prompts: list[str],
+    ) -> list[str]:
+        """[conciseness prefix] + [question] + [conciseness suffix]. No Turn 2.
+
+        Mirrors train_opsdc.sh: the self-teacher receives the length_prune_teacher
+        conciseness instruction wrapping the bare question — no GT, no memo.
+        """
+        cfg = self._get_prompt_config()["length_prune_teacher"]
+        teacher_prompts = []
+        for sp in student_prompts:
+            question_content = json.loads(sp)[0]["content"]
+            content = cfg["prefix"] + question_content + cfg["suffix"]
+            teacher_prompts.append(json.dumps([{"role": "user", "content": content}]))
+        return teacher_prompts
+
     # ------------------------------------------------------------------
     # Phase 3: OPSD Update
     # ------------------------------------------------------------------
@@ -1340,6 +1357,9 @@ class OPSDTrainer:
             ),
             "gt_directly": lambda: self._build_teacher_prompts_gt_directly(
                 student_prompts, ground_truths,
+            ),
+            "conciseness_instruction": lambda: self._build_teacher_prompts_conciseness_instruction(
+                student_prompts,
             ),
         }
         teacher_prompts = builders[self.teacher_ctx_mode]()
@@ -1498,6 +1518,7 @@ class OPSDTrainer:
                 "reflection_from_gt_turn2_truncated", {},
             ).get("template", turn2_incorrect)
         gt_directly_cfg = prompts_cfg.get("gt_directly_teacher", {})
+        conciseness_cfg = prompts_cfg.get("length_prune_teacher", {})
 
         rescued_set = (
             rescue_meta.get("rescued_indices", set()) if rescue_meta else set()
@@ -1550,6 +1571,13 @@ class OPSDTrainer:
                     + gt_directly_cfg.get("prefix", "")
                     + str(gt)
                     + gt_directly_cfg.get("suffix", "")
+                )
+                teacher_input = [{"role": "user", "content": teacher_content}]
+            elif self.teacher_ctx_mode == "conciseness_instruction":
+                teacher_content = (
+                    conciseness_cfg.get("prefix", "")
+                    + original_content
+                    + conciseness_cfg.get("suffix", "")
                 )
                 teacher_input = [{"role": "user", "content": teacher_content}]
             else:  # sd_prompt — passthrough from dataset

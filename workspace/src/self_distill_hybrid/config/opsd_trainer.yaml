@@ -147,6 +147,8 @@ opsd:
   #                          reflection_from_gt_teacher prefix/suffix
   #   "gt_directly"        — ground truth wrapped in gt_directly_teacher
   #                          prefix/suffix (no Turn 2)
+  #   "conciseness_instruction" — length_prune_teacher prompt wrapping the
+  #                          question (no Turn 2, matches train_opsdc.sh)
   teacher_ctx_mode: sd_prompt
 
   # ---- Turn 2 generation knobs (used by modes that run Turn 2) ----
