@@ -55,7 +55,7 @@ DISTANCE_WEIGHT_ALPHA=${DISTANCE_WEIGHT_ALPHA:-2.0}
 
 # ---- teacher_ctx_reinjection ----
 REINJECTION_ENABLED=${REINJECTION_ENABLED:-false}
-REINJECTION_MODE=${REINJECTION_MODE:-cumulative}   # cumulative | multi_pass
+REINJECTION_MODE=${REINJECTION_MODE:-multi_pass}   # multi_pass (default) | cumulative
 REINJECTION_INTERVAL=${REINJECTION_INTERVAL:-2048}
 REINJECTION_CONTENT=${REINJECTION_CONTENT:-specific_context}
 

@@ -163,7 +163,7 @@ class OPSDTrainer:
         self.reinjection_interval = int(rj_cfg.get("interval", 2048))
         self.reinjection_content = str(rj_cfg.get("content", "specific_context"))
         self.reinjection_wrapper = str(rj_cfg.get("wrapper", "natural"))
-        self.reinjection_mode = str(rj_cfg.get("mode", "cumulative"))
+        self.reinjection_mode = str(rj_cfg.get("mode", "multi_pass"))
         assert self.reinjection_content in (
             "specific_context", "conciseness_instruction",
         ), f"Invalid reinjection content: {self.reinjection_content}"

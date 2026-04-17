@@ -224,7 +224,7 @@ opsd:
   # wrapper: only "natural" — "Actually, I recall: {...}. Continuing from this."
   teacher_ctx_reinjection:
     enabled: false
-    mode: cumulative                  # cumulative | multi_pass
+    mode: multi_pass                  # multi_pass (default) | cumulative
     interval: 2048                    # snap back to last sentence before k * interval
     content: specific_context         # specific_context | conciseness_instruction
     wrapper: natural
