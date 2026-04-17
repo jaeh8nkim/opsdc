@@ -13,8 +13,10 @@ Key differences from SelfDistillTrainer (sd_trainer.py):
   - Teacher model is the frozen ref_module_fsdp (initial policy weights)
 """
 
+import glob
 import json
 import logging
+import math
 import os
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,12 @@ from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 
+from .kl_probe import (
+    KLProbeAccumulator,
+    KLProbeConfig,
+    find_think_close,
+    snap_to_boundary,
+)
 from .sd_verifier import build_opsd_batch, build_sft_batch, verify_batch
 
 py_logger = logging.getLogger(__name__)
@@ -122,6 +130,41 @@ class OPSDTrainer:
             f"(expected one of {sorted(TEACHER_CTX_MODES)})"
         )
 
+        # ---- KL-by-position probe config ----
+        kl_by_pos_cfg = self.opsd_config.get("kl_by_pos", {}) or {}
+        self.kl_probe_cfg = KLProbeConfig(
+            enabled=bool(kl_by_pos_cfg.get("enabled", True)),
+            plot_freq=int(kl_by_pos_cfg.get("plot_freq", 50)),
+            n_abs_bins=int(kl_by_pos_cfg.get("n_abs_bins", 64)),
+            max_position=int(kl_by_pos_cfg.get("max_position", 8192)),
+            min_tokens_per_bin=int(kl_by_pos_cfg.get("min_tokens_per_bin", 30)),
+        )
+        self.kl_analyze_only = bool(self.opsd_config.get("kl_analyze_only", False))
+        self.kl_probe = KLProbeAccumulator(self.kl_probe_cfg)
+
+        # ---- Distance-weighting config ----
+        dw_cfg = self.opsd_config.get("distance_weighting", {}) or {}
+        self.distance_weight_schedule = str(dw_cfg.get("schedule", "off"))
+        self.distance_weight_late_multiplier = float(dw_cfg.get("late_multiplier", 2.0))
+        self.distance_weight_alpha = float(dw_cfg.get("alpha", 2.0))
+        self.distance_weight_per_sample_norm = bool(dw_cfg.get("per_sample_norm", True))
+        assert self.distance_weight_schedule in ("off", "linear", "exp", "step"), (
+            f"Invalid distance_weighting.schedule: {self.distance_weight_schedule}"
+        )
+
+        # ---- Reinjection config ----
+        rj_cfg = self.opsd_config.get("teacher_ctx_reinjection", {}) or {}
+        self.reinjection_enabled = bool(rj_cfg.get("enabled", False))
+        self.reinjection_interval = int(rj_cfg.get("interval", 2048))
+        self.reinjection_content = str(rj_cfg.get("content", "specific_context"))
+        self.reinjection_wrapper = str(rj_cfg.get("wrapper", "natural"))
+        assert self.reinjection_content in (
+            "specific_context", "conciseness_instruction",
+        ), f"Invalid reinjection content: {self.reinjection_content}"
+        assert self.reinjection_wrapper == "natural", (
+            f"Only wrapper=natural is supported (got {self.reinjection_wrapper})"
+        )
+
         # Detailed logging
         self.log_dir = self.opsd_config.get(
             "detailed_log_dir",
@@ -134,14 +177,22 @@ class OPSDTrainer:
         self.opsd_log_dir = os.path.join(self.log_dir, "opsd")
         self.val_log_dir = os.path.join(self.log_dir, "val_generations")
         self.epiphany_log_dir = os.path.join(self.log_dir, "epiphany")
+        # KL probe directories (PDFs + .npz, plus per-rank staging files).
+        session_root = os.path.dirname(self.log_dir.rstrip("/")) or self.log_dir
+        self.kl_plots_dir = os.path.join(session_root, "kl_plots")
+        self.kl_probe_staging_dir = os.path.join(self.kl_plots_dir, ".staging")
         os.makedirs(self.rollout_log_dir, exist_ok=True)
         os.makedirs(self.opsd_log_dir, exist_ok=True)
         os.makedirs(self.val_log_dir, exist_ok=True)
         os.makedirs(self.epiphany_log_dir, exist_ok=True)
+        if self.kl_probe_cfg.enabled:
+            os.makedirs(self.kl_plots_dir, exist_ok=True)
+            os.makedirs(self.kl_probe_staging_dir, exist_ok=True)
         py_logger.info("Rollout logs -> %s", self.rollout_log_dir)
         py_logger.info("OPSD logs    -> %s", self.opsd_log_dir)
         py_logger.info("Val gen logs -> %s", self.val_log_dir)
         py_logger.info("Epiphany logs-> %s", self.epiphany_log_dir)
+        py_logger.info("KL plots     -> %s", self.kl_plots_dir)
 
         # Load expert demonstrations (optional)
         expert_demo_path = self.opsd_config.get("expert_demo_path", None)
@@ -858,6 +909,51 @@ class OPSDTrainer:
                     metrics.update(opsd_metrics)
                     metrics["timing/train_s"] = train_time
 
+                    # ---- KL probe: ingest per-rank staging files and flush on schedule ----
+                    if self.kl_probe_cfg.enabled and self.loss_type == "reverse_kl":
+                        # Build active correct/truncated masks in active-sample order,
+                        # matching shard_batch_idx assignments made in _opsd_update.
+                        if kl_mask is not None:
+                            active_idx = [i for i, m in enumerate(kl_mask) if m]
+                        else:
+                            active_idx = list(range(batch_size))
+                        active_correct = [bool(correct_mask[i]) for i in active_idx]
+                        active_truncated = [bool(truncated_mask[i]) for i in active_idx]
+                        probe_t0 = time.time()
+                        self._ingest_kl_probe_staging(
+                            self.global_steps, active_correct, active_truncated,
+                        )
+                        metrics["timing/kl_probe_ingest_s"] = time.time() - probe_t0
+
+                        # Flush at step 1 and every plot_freq.
+                        pf = max(1, self.kl_probe_cfg.plot_freq)
+                        should_flush = (
+                            self.global_steps == 1
+                            or self.global_steps % pf == 0
+                        )
+                        if should_flush and self.kl_probe.has_data():
+                            flush_t0 = time.time()
+                            self.kl_probe.flush(
+                                output_dir=self.kl_plots_dir,
+                                step=int(self.global_steps),
+                                meta={"teacher_ctx_mode": self.teacher_ctx_mode},
+                            )
+                            self.kl_probe.reset()
+                            metrics["timing/kl_probe_flush_s"] = time.time() - flush_t0
+                            py_logger.info(
+                                "Step %d: KL probe flushed to %s",
+                                self.global_steps, self.kl_plots_dir,
+                            )
+
+                    # ---- KL_ANALYZE_ONLY: exit after the first-step diagnostic flush ----
+                    if self.kl_analyze_only and self.global_steps >= 1:
+                        py_logger.info(
+                            "KL_ANALYZE_ONLY: diagnostic flush complete, exiting after step %d.",
+                            self.global_steps,
+                        )
+                        logger.log(data=metrics, step=self.global_steps)
+                        return
+
                 # ---- Teacher weight update (if configured) ----
                 if self.teacher_update_freq > 0 and self.global_steps % self.teacher_update_freq == 0:
                     teacher_t0 = time.time()
@@ -1309,6 +1405,270 @@ class OPSDTrainer:
         return teacher_prompts
 
     # ------------------------------------------------------------------
+    # Reinjection helpers
+    # ------------------------------------------------------------------
+
+    _CONCISENESS_REINJECT_SNIPPET = (
+        "\n\nActually, I should stay concise — avoid unnecessary elaboration, "
+        "redundant steps, or restating the problem. Focus only on the key "
+        "reasoning steps needed to reach the answer. Continuing from this.\n\n"
+    )
+
+    def _build_reinject_snippet_text(self, ctx_text: Optional[str]) -> Optional[str]:
+        """Build the natural-wrapper snippet text for one sample.
+
+        Returns None if the content variant can't be constructed for this sample
+        (e.g. specific_context with empty ctx_text).
+        """
+        content = self.reinjection_content
+        if content == "conciseness_instruction":
+            return self._CONCISENESS_REINJECT_SNIPPET
+        if not ctx_text:
+            return None
+        if content == "specific_context":
+            # Full ctx text wrapped in the natural recall frame. Previously we
+            # used only the first sentence; removed because split(".") was
+            # fragile on abbreviations, decimals, and math equations, and the
+            # "compressed" operating point wasn't carrying clear signal.
+            return f"\n\nActually, I recall: {ctx_text}. Continuing from this.\n\n"
+        raise ValueError(f"Unknown reinjection content: {content}")
+
+    def _build_reinject_positions(
+        self,
+        response_text: str,
+    ) -> tuple[set[int], int]:
+        """Return (reinject_positions, think_close_pos) for one response.
+
+        Positions snap back to the nearest sentence boundary; reinjection fires
+        only while inside the ``<think>`` block (stops at ``</think>``). For
+        truncated rollouts (no ``</think>``), applies for the entire response.
+        """
+        response_ids = self.tokenizer.encode(response_text, add_special_tokens=False)
+        if not response_ids:
+            return set(), 0
+        if response_ids[-1] != self.tokenizer.eos_token_id:
+            response_ids = response_ids + [self.tokenizer.eos_token_id]
+
+        think_close_pos = find_think_close(response_ids, self.tokenizer)
+
+        positions: set[int] = set()
+        interval = self.reinjection_interval
+        next_target = interval
+        while next_target < len(response_ids):
+            in_thinking = (think_close_pos is None) or (next_target < think_close_pos)
+            if not in_thinking:
+                break
+            snap_pos = snap_to_boundary(response_ids, next_target, self.tokenizer)
+            # Only keep positions strictly inside the thinking block after snap.
+            if (think_close_pos is None) or (snap_pos < think_close_pos):
+                positions.add(snap_pos)
+            next_target += interval
+        return positions, len(response_ids)
+
+    def _build_reinjection_arrays(
+        self,
+        responses: list[str],
+        ctx_texts: list[Optional[str]],
+    ) -> tuple[list[Optional[list[int]]], list[Optional[set[int]]]]:
+        """For each sample, produce (snippet_ids, positions) or (None, None).
+
+        Used by ``build_opsd_batch`` to interleave snippets into teacher
+        sequences. When reinjection is disabled globally, or when a snippet
+        can't be constructed for a sample, the sample passes through unchanged.
+        """
+        if not self.reinjection_enabled:
+            return [None] * len(responses), [None] * len(responses)
+
+        snippet_list: list[Optional[list[int]]] = []
+        positions_list: list[Optional[set[int]]] = []
+        for resp, ctx in zip(responses, ctx_texts):
+            snippet_text = self._build_reinject_snippet_text(ctx)
+            if not snippet_text:
+                snippet_list.append(None)
+                positions_list.append(None)
+                continue
+            snippet_ids = self.tokenizer.encode(snippet_text, add_special_tokens=False)
+            positions, _ = self._build_reinject_positions(resp)
+            if not positions:
+                snippet_list.append(None)
+                positions_list.append(None)
+                continue
+            snippet_list.append(snippet_ids)
+            positions_list.append(positions)
+        return snippet_list, positions_list
+
+    def _resolve_ctx_texts_for_reinjection(
+        self,
+        student_prompts: list[str],
+        ground_truths: list[str],
+        epiphanies: Optional[list[str]],
+    ) -> list[Optional[str]]:
+        """Return the per-sample ctx text to use when reinjection content =
+        specific_context or full. Depends on ``teacher_ctx_mode``.
+
+        - reflection_from_gt: the Turn 2 epiphany memo.
+        - gt_directly: the ground-truth string.
+        - conciseness_instruction / sd_prompt: no per-sample ctx → None.
+          (content=conciseness_instruction doesn't use these anyway; content=
+          specific_context/full becomes a no-op for those samples.)
+        """
+        n = len(student_prompts)
+        if self.teacher_ctx_mode == "reflection_from_gt" and epiphanies is not None:
+            return [e if e else None for e in epiphanies]
+        if self.teacher_ctx_mode == "gt_directly":
+            return [str(gt) if gt is not None else None for gt in ground_truths]
+        return [None] * n
+
+    # ------------------------------------------------------------------
+    # Distance-weighting helpers
+    # ------------------------------------------------------------------
+
+    def _distance_weight_raw(self, relpos: torch.Tensor) -> torch.Tensor:
+        """Schedule function applied to relpos ∈ [0, 1]. Monotone non-decreasing.
+
+        Raw weights at relpos=0 → 1.0 and at relpos=1 → late_multiplier (default 2).
+        """
+        M = self.distance_weight_late_multiplier
+        schedule = self.distance_weight_schedule
+        if schedule == "linear":
+            return 1.0 + (M - 1.0) * relpos
+        if schedule == "exp":
+            a = self.distance_weight_alpha
+            denom = math.exp(a) - 1.0
+            if denom <= 0:
+                return torch.ones_like(relpos)
+            return 1.0 + (torch.exp(a * relpos) - 1.0) / denom * (M - 1.0)
+        if schedule == "step":
+            return torch.where(
+                relpos < 0.5,
+                torch.ones_like(relpos),
+                torch.full_like(relpos, M),
+            )
+        # "off"
+        return torch.ones_like(relpos)
+
+    def _build_kl_token_weights_padded(
+        self,
+        student_loss_mask: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Build the (B, max_L) padded weight tensor for distance_weighted_kl.
+
+        Per sample: weights at response-token positions follow the schedule,
+        per-sample normalized so sum(weights_i) == L_i (mean-preserving).
+        Non-response positions are zero.
+
+        Returns None if distance weighting is off.
+        """
+        if self.distance_weight_schedule == "off":
+            return None
+
+        B, max_L = student_loss_mask.shape
+        weights = torch.zeros(B, max_L, dtype=torch.float32)
+        for i in range(B):
+            mask_i = student_loss_mask[i]
+            resp_idx = mask_i.nonzero(as_tuple=True)[0]
+            L = int(resp_idx.numel())
+            if L <= 0:
+                continue
+            denom = max(L - 1, 1)
+            positions = torch.arange(L, dtype=torch.float32)
+            relpos = positions / float(denom)
+            raw = self._distance_weight_raw(relpos)
+            if self.distance_weight_per_sample_norm and float(raw.sum()) > 0:
+                raw = raw * (L / float(raw.sum()))
+            weights[i, resp_idx] = raw
+        return weights
+
+    # ------------------------------------------------------------------
+    # KL probe staging-file ingestion
+    # ------------------------------------------------------------------
+
+    def _ingest_kl_probe_staging(
+        self,
+        step: int,
+        active_correct_mask: list[bool],
+        active_truncated_mask: list[bool],
+    ) -> None:
+        """Read per-rank staging files for ``step``, feed to ``self.kl_probe``.
+
+        The trainer emits ``shard_batch_idx`` on the dispatched batch so each
+        rank's returned per-sample data can be aligned back to the original
+        active-sample ordering. Correctness/truncation flags are then looked up
+        by that index.
+        """
+        if not self.kl_probe_cfg.enabled:
+            return
+
+        pattern = os.path.join(self.kl_probe_staging_dir, f"step{step:06d}_rank*.pt")
+        files = sorted(glob.glob(pattern))
+        if not files:
+            return
+
+        # Gather (shard_batch_idx → (kl_array, length)) across ranks.
+        per_sample: dict[int, tuple[np.ndarray, int]] = {}
+        for path in files:
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception as e:
+                py_logger.warning("KL probe: failed to load %s: %s", path, e)
+                continue
+            flat = payload.get("per_token_kl_flat")
+            lengths = payload.get("per_sample_lengths")
+            batch_idx = payload.get("shard_batch_indices")
+            if flat is None or lengths is None:
+                continue
+            flat_np = flat.detach().float().cpu().numpy()
+            lens = [int(x) for x in lengths.tolist()]
+            # Split flat → per-sample arrays by length.
+            cursor = 0
+            for i, L in enumerate(lens):
+                if L <= 0:
+                    continue
+                arr = flat_np[cursor : cursor + L].copy()
+                cursor += L
+                if batch_idx is not None and i < len(batch_idx):
+                    idx = int(batch_idx[i].item())
+                else:
+                    idx = -1  # unknown — fallback to sequential match
+                per_sample[idx] = (arr, L)
+            # Cleanup the file after consumption.
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+        if not per_sample:
+            return
+
+        # Order by shard_batch_idx when available; else accept iteration order.
+        ordered_items = sorted(per_sample.items(), key=lambda kv: kv[0])
+        kl_arrays: list[np.ndarray] = []
+        lengths: list[int] = []
+        correct: list[bool] = []
+        truncated: list[bool] = []
+        for idx, (arr, L) in ordered_items:
+            if 0 <= idx < len(active_correct_mask):
+                correct.append(bool(active_correct_mask[idx]))
+                truncated.append(bool(active_truncated_mask[idx]))
+            else:
+                # Fallback: unknown index → skip (conservative; avoids mislabeling).
+                continue
+            kl_arrays.append(arr)
+            lengths.append(L)
+
+        if not kl_arrays:
+            return
+
+        # Feed to accumulator as one synthetic "step" — flat KL ordered by sample.
+        flat_cat = np.concatenate(kl_arrays, axis=0) if kl_arrays else np.zeros(0, np.float32)
+        self.kl_probe.add_step(
+            torch.from_numpy(flat_cat),
+            student_lengths=lengths,
+            correct_mask=correct,
+            truncated_mask=truncated,
+        )
+
+    # ------------------------------------------------------------------
     # Phase 3: OPSD Update
     # ------------------------------------------------------------------
 
@@ -1364,18 +1724,42 @@ class OPSDTrainer:
         }
         teacher_prompts = builders[self.teacher_ctx_mode]()
 
+        # ---- Reinjection: compute per-sample snippet_ids + positions ----
+        ctx_texts = self._resolve_ctx_texts_for_reinjection(
+            student_prompts, ground_truths, epiphanies,
+        )
+        teacher_reinject_snippets, teacher_reinject_positions = self._build_reinjection_arrays(
+            responses, ctx_texts,
+        )
+        n_reinjected = sum(1 for p in teacher_reinject_positions if p)
+
         opsd_batch = build_opsd_batch(
             teacher_prompts=teacher_prompts,
             student_prompts=student_prompts,
             responses=responses,
             tokenizer=self.tokenizer,
             max_length=self.sft_max_length,
+            teacher_reinject_snippets=teacher_reinject_snippets,
+            teacher_reinject_positions=teacher_reinject_positions,
         )
 
         if opsd_batch is None:
             return {"opsd/loss": 0.0, "opsd/skipped": 1.0}
 
         n_samples = opsd_batch.batch["student_input_ids"].shape[0]
+
+        # ---- Distance-weighting: build (B, max_L) padded weights tensor ----
+        kl_weights_padded = self._build_kl_token_weights_padded(
+            opsd_batch.batch["student_loss_mask"]
+        )
+        if kl_weights_padded is not None:
+            opsd_batch.batch["kl_token_weights_padded"] = kl_weights_padded
+
+        # ---- shard_batch_idx: identity index for kl_probe alignment ----
+        if self.kl_probe_cfg.enabled:
+            opsd_batch.batch["shard_batch_idx"] = torch.arange(
+                n_samples, dtype=torch.long
+            )
 
         # DP-pad: ensure batch is divisible by number of DP workers
         n_dp = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
@@ -1387,6 +1771,12 @@ class OPSDTrainer:
                 tensor = opsd_batch.batch[key]
                 last = tensor[-1:].expand(pad_count, *tensor.shape[1:]).clone()
                 padded_dict[key] = torch.cat([tensor, last], dim=0)
+            # shard_batch_idx for padding rows: -1 sentinel (won't match any active sample)
+            if "shard_batch_idx" in padded_dict:
+                sentinel = torch.full((pad_count,), -1, dtype=torch.long)
+                padded_dict["shard_batch_idx"] = torch.cat(
+                    [opsd_batch.batch["shard_batch_idx"], sentinel], dim=0,
+                )
             opsd_batch = DataProto.from_single_dict(padded_dict)
             py_logger.debug(
                 "Step %d: Padded OPSD batch from %d to %d for %d DP workers",
@@ -1396,10 +1786,16 @@ class OPSDTrainer:
         # Pass config via meta_info so the worker can read it
         opsd_batch.meta_info["opsd_beta"] = self.beta
         opsd_batch.meta_info["opsd_loss_type"] = self.loss_type
+        # KL probe staging — worker writes its shard's per-token KL to this dir.
+        if self.kl_probe_cfg.enabled and self.loss_type == "reverse_kl":
+            opsd_batch.meta_info["collect_per_token_kl"] = True
+            opsd_batch.meta_info["kl_probe_staging_dir"] = self.kl_probe_staging_dir
+            opsd_batch.meta_info["global_steps"] = int(self.global_steps)
 
         py_logger.info(
-            "Step %d: OPSD update with %d samples (beta=%.2f, loss=%s)",
+            "Step %d: OPSD update with %d samples (beta=%.2f, loss=%s, reinject=%d, dw=%s)",
             self.global_steps, n_samples, self.beta, self.loss_type,
+            n_reinjected, self.distance_weight_schedule,
         )
 
         # Dispatch to workers
@@ -1408,6 +1804,8 @@ class OPSDTrainer:
         # Reduce metrics across DP workers
         opsd_metrics = reduce_metrics(opsd_output.meta_info["metrics"])
         opsd_metrics["opsd/n_samples"] = n_samples
+        opsd_metrics["opsd/n_reinjected"] = n_reinjected
+        opsd_metrics["opsd/distance_weighting"] = self.distance_weight_schedule
         return opsd_metrics
 
     # ------------------------------------------------------------------

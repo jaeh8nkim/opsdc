@@ -43,6 +43,21 @@ KL_GATING=${KL_GATING:-all}
 #   incorrect_only         — KL only on incorrect rollouts
 EXPERT_DEMO_PATH=${EXPERT_DEMO_PATH:-./workspace/data/expert_demonstrations/expert_demos_3200.parquet}
 
+# ---- KL-by-position probe ----
+KL_POS_LOGGING=${KL_POS_LOGGING:-true}
+KL_ANALYZE_ONLY=${KL_ANALYZE_ONLY:-false}
+PLOT_FREQ=${PLOT_FREQ:-50}
+
+# ---- distance_weighted_kl ----
+DISTANCE_WEIGHT_SCHEDULE=${DISTANCE_WEIGHT_SCHEDULE:-off}
+DISTANCE_WEIGHT_LATE_MULT=${DISTANCE_WEIGHT_LATE_MULT:-2.0}
+DISTANCE_WEIGHT_ALPHA=${DISTANCE_WEIGHT_ALPHA:-2.0}
+
+# ---- teacher_ctx_reinjection ----
+REINJECTION_ENABLED=${REINJECTION_ENABLED:-false}
+REINJECTION_INTERVAL=${REINJECTION_INTERVAL:-2048}
+REINJECTION_CONTENT=${REINJECTION_CONTENT:-specific_context}
+
 MODEL_PATH=${MODEL_PATH:?MODEL_PATH environment variable is required} \
 SD_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts.parquet \
 SD_VAL_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts_val.parquet \
@@ -78,4 +93,13 @@ bash workspace/scripts/sft/train_opsd.sh \
     opsd.turn2_rescue_tokens=$TURN2_RESCUE_TOKENS \
     opsd.turn2_teacher_ctx_tokens=$TURN2_TEACHER_CTX_TOKENS \
     opsd.expert_demo_path="$EXPERT_DEMO_PATH" \
-    opsd.kl_gating=$KL_GATING
+    opsd.kl_gating=$KL_GATING \
+    opsd.kl_by_pos.enabled=$KL_POS_LOGGING \
+    opsd.kl_by_pos.plot_freq=$PLOT_FREQ \
+    opsd.kl_analyze_only=$KL_ANALYZE_ONLY \
+    opsd.distance_weighting.schedule=$DISTANCE_WEIGHT_SCHEDULE \
+    opsd.distance_weighting.late_multiplier=$DISTANCE_WEIGHT_LATE_MULT \
+    opsd.distance_weighting.alpha=$DISTANCE_WEIGHT_ALPHA \
+    opsd.teacher_ctx_reinjection.enabled=$REINJECTION_ENABLED \
+    opsd.teacher_ctx_reinjection.interval=$REINJECTION_INTERVAL \
+    opsd.teacher_ctx_reinjection.content=$REINJECTION_CONTENT

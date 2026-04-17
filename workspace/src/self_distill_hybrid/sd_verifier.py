@@ -229,8 +229,17 @@ def _tokenize_sequence(
     tokenizer: PreTrainedTokenizer,
     max_length: int,
     pad_token_id: int,
+    reinject_snippet_ids: Optional[list[int]] = None,
+    reinject_positions: Optional[set[int]] = None,
 ) -> Optional[dict]:
     """Tokenize a single (prompt, response) pair into padded tensors.
+
+    When ``reinject_snippet_ids`` and ``reinject_positions`` are provided,
+    interleaves the snippet into the response at each student position in
+    ``reinject_positions``. The loss_mask is 0 for snippet tokens (teacher
+    context only, not scored) and 1 for student response tokens. The output
+    ``_forward_logits_*`` path naturally produces logits for student response
+    tokens in order, so no separate teacher_pos_map is needed — see plan.
 
     Returns dict with input_ids, attention_mask, position_ids, loss_mask,
     or None if the sequence is too short.
@@ -243,8 +252,21 @@ def _tokenize_sequence(
     if not response_ids or response_ids[-1] != tokenizer.eos_token_id:
         response_ids = response_ids + [tokenizer.eos_token_id]
 
-    full_ids = prompt_ids + response_ids
-    loss_mask = [0] * len(prompt_ids) + [1] * len(response_ids)
+    if reinject_snippet_ids and reinject_positions:
+        # Build interleaved response body + corresponding loss mask segment.
+        body_ids: list[int] = []
+        body_loss: list[int] = []
+        for s_t, tok in enumerate(response_ids):
+            if s_t in reinject_positions:
+                body_ids.extend(reinject_snippet_ids)
+                body_loss.extend([0] * len(reinject_snippet_ids))
+            body_ids.append(tok)
+            body_loss.append(1)
+        full_ids = prompt_ids + body_ids
+        loss_mask = [0] * len(prompt_ids) + body_loss
+    else:
+        full_ids = prompt_ids + response_ids
+        loss_mask = [0] * len(prompt_ids) + [1] * len(response_ids)
 
     if len(full_ids) > max_length:
         full_ids = full_ids[:max_length]
@@ -269,6 +291,8 @@ def build_opsd_batch(
     responses: list[str],
     tokenizer: PreTrainedTokenizer,
     max_length: int = 32768,
+    teacher_reinject_snippets: Optional[list[Optional[list[int]]]] = None,
+    teacher_reinject_positions: Optional[list[Optional[set[int]]]] = None,
 ) -> Optional[DataProto]:
     """Build paired teacher/student tokenized sequences for OPSD JSD training.
 
@@ -279,12 +303,25 @@ def build_opsd_batch(
 
     The loss_mask marks response positions where JSD should be computed.
 
+    When ``teacher_reinject_snippets`` and ``teacher_reinject_positions`` are
+    provided (one entry per sample, may be None/empty to disable per-sample),
+    the teacher sequence interleaves the given snippet token ids at the given
+    student response positions. The teacher ``loss_mask`` is 0 at snippet
+    tokens, so ``_forward_logits_*`` naturally yields teacher logits for
+    the student's response tokens in order — aligned 1:1 with the student
+    side without a separate index map.
+
     Args:
         teacher_prompts: JSON-string chat messages with teacher solution (sd_prompt).
         student_prompts: JSON-string chat messages with question only (sft_prompt).
         responses: Student-generated response strings.
         tokenizer: HuggingFace tokenizer.
         max_length: Max total sequence length.
+        teacher_reinject_snippets: Per-sample snippet token ids to interleave
+            into the teacher response. ``None`` per sample disables reinjection
+            for that sample.
+        teacher_reinject_positions: Per-sample student response positions at
+            which to insert the snippet. ``None``/empty disables.
 
     Returns:
         DataProto with keys: teacher_input_ids, teacher_attention_mask,
@@ -299,12 +336,25 @@ def build_opsd_batch(
     if pad_token_id is None:
         pad_token_id = tokenizer.eos_token_id
 
+    n = len(teacher_prompts)
+    if teacher_reinject_snippets is None:
+        teacher_reinject_snippets = [None] * n
+    if teacher_reinject_positions is None:
+        teacher_reinject_positions = [None] * n
+
     teacher_seqs = []
     student_seqs = []
     skipped = 0
 
-    for t_prompt, s_prompt, response_text in zip(teacher_prompts, student_prompts, responses):
-        t_seq = _tokenize_sequence(t_prompt, response_text, tokenizer, max_length, pad_token_id)
+    for t_prompt, s_prompt, response_text, snippet_ids, positions in zip(
+        teacher_prompts, student_prompts, responses,
+        teacher_reinject_snippets, teacher_reinject_positions,
+    ):
+        t_seq = _tokenize_sequence(
+            t_prompt, response_text, tokenizer, max_length, pad_token_id,
+            reinject_snippet_ids=snippet_ids,
+            reinject_positions=positions,
+        )
         s_seq = _tokenize_sequence(s_prompt, response_text, tokenizer, max_length, pad_token_id)
 
         if t_seq is None or s_seq is None:

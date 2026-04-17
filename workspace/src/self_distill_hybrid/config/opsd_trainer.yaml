@@ -170,6 +170,57 @@ opsd:
   #   "all" (default), "correct_only", "correct_and_truncated", "incorrect_only"
   kl_gating: all
 
+  # ---- KL-by-position probe (training-time diagnostic) ----
+  # Accumulates per-token reverse-KL values during training and renders
+  # per-stratum PDFs (ended_correct / ended_incorrect / truncated / all) plus
+  # a single overlay PDF at flush points (step 1 and every plot_freq).
+  # 5 PDFs + 5 .npz per flush (4 per-stratum PDFs/NPZs + 1 overlay PDF + 1
+  # raw_trajectories.npz).
+  kl_by_pos:
+    enabled: true
+    plot_freq: 50                     # flush at step 1, then every plot_freq
+    n_abs_bins: 64                    # 64 × 128 tokens over [0, max_position]
+    max_position: 8192
+    min_tokens_per_bin: 30            # sparse-bin suppression threshold
+
+  # ---- Analyze-only mode ----
+  # When true, the trainer runs one step (diagnostic + flush) and exits without
+  # further training. Used with a loaded checkpoint to get KL-by-position plots
+  # without running a full training job.
+  kl_analyze_only: false
+
+  # ---- distance_weighted_kl (arm C) ----
+  # Per-token KL weights as a function of relative position in the rollout.
+  # schedule=off  → baseline (no weighting). Default.
+  # schedule=linear / exp / step use late_multiplier as the 1:M late/early ratio.
+  # After per-sample normalization, sum(weights_i) == L_i, so total loss magnitude
+  # is preserved (only redistributed within each sample).
+  distance_weighting:
+    schedule: off                     # off | linear | exp | step
+    late_multiplier: 2.0              # raw ratio late/early (tuning knob)
+    alpha: 2.0                        # only used for schedule=exp
+    per_sample_norm: true
+
+  # ---- teacher_ctx_reinjection (arms B1/B2) ----
+  # Interleave a natural-language mid-thinking snippet into the teacher input
+  # sequence at sentence-boundary-snapped positions derived from ``interval``.
+  # Fires only while inside <think>; stops at </think>. Cumulative: all prior
+  # snippets remain in the teacher's causal context (standard attention).
+  #
+  # content:
+  #   specific_context        — inject the full ctx text (B1 arm — re-assert the
+  #                             same ctx that was originally prepended before
+  #                             reasoning started).
+  #   conciseness_instruction — hardcoded generic compression directive (B2
+  #                             arm — tests whether a content-free nudge
+  #                             suffices).
+  # wrapper: only "natural" — "Actually, I recall: {...}. Continuing from this."
+  teacher_ctx_reinjection:
+    enabled: false
+    interval: 2048                    # snap back to last sentence before k * interval
+    content: specific_context         # specific_context | conciseness_instruction
+    wrapper: natural
+
 # ---------- Reward model (disabled for OPSD) ----------
 reward_model:
   enable: false

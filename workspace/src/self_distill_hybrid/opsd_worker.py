@@ -13,6 +13,7 @@ Key difference from ``update_sft``:
 
 import logging
 import math
+import os
 from typing import Optional
 
 import psutil
@@ -219,7 +220,22 @@ class OPSDWorker(SelfDistillWorker):
         total_teacher_entropy = 0.0
         total_entropy_tokens = 0
 
-        for micro_batch in micro_batches:
+        # kl_probe collection (per-token KL + per-sample response lengths across
+        # the shard). Written to a staging file at end of step when enabled.
+        collect_per_token_kl = bool(data.meta_info.get("collect_per_token_kl", False)) \
+            and loss_type == "reverse_kl"
+        per_token_kl_chunks: list[torch.Tensor] = []
+        per_sample_lengths_shard: list[int] = []
+
+        # Per-sample original batch indices (for matching trainer-side correctness
+        # / truncation masks after DP sharding). Each sample in the shard has an
+        # integer batch index; we track them per micro-batch.
+        per_sample_batch_indices_shard: list[int] = []
+
+        # Distance-weighting token weights (padded) — optional input batch field.
+        has_token_weights = "kl_token_weights_padded" in data.batch.keys()
+
+        for mb_idx, micro_batch in enumerate(micro_batches):
             micro_batch = micro_batch.to(device)
 
             # Extract teacher tensors
@@ -233,6 +249,17 @@ class OPSDWorker(SelfDistillWorker):
             s_attention_mask = micro_batch.batch["student_attention_mask"]
             s_position_ids = micro_batch.batch["student_position_ids"]
             s_loss_mask = micro_batch.batch["student_loss_mask"]
+
+            # Per-sample response lengths (number of loss_mask=1 positions per row).
+            # Used for both kl_probe split-per-sample and optional token-weight extraction.
+            mb_sample_lengths = s_loss_mask.sum(dim=-1).to(torch.long).cpu().tolist()
+            if collect_per_token_kl:
+                per_sample_lengths_shard.extend(int(L) for L in mb_sample_lengths)
+                # Original batch indices if provided by trainer
+                if "shard_batch_idx" in micro_batch.batch.keys():
+                    per_sample_batch_indices_shard.extend(
+                        micro_batch.batch["shard_batch_idx"].cpu().tolist()
+                    )
 
             # Teacher forward (frozen, no grad)
             with torch.no_grad():
@@ -278,10 +305,48 @@ class OPSDWorker(SelfDistillWorker):
                 raise ValueError(f"Unknown loss_type: {loss_type!r}. Expected one of {list(loss_fn_map)}")
             fn_standard, fn_liger = loss_fn_map[loss_type]
 
-            if use_liger:
-                loss, n_tokens = fn_liger(t_logits_aligned, s_logits_aligned, beta=beta)
+            # Optional per-token KL weights (for distance_weighted_kl). Provided by
+            # the trainer as a (mb_B, max_L) padded tensor aligned with student
+            # input_ids. Extracted to a (min_len,) flat tensor using the same
+            # shift+mask logic as _forward_logits_*.
+            mb_token_weights = None
+            if has_token_weights:
+                w_padded = micro_batch.batch["kl_token_weights_padded"]  # (mb_B, max_L)
+                mb_token_weights = self._extract_response_values(
+                    w_padded, s_loss_mask
+                ).to(s_logits_aligned.device)
+                # Safety: trim to min_len in case of any length divergence.
+                mb_token_weights = mb_token_weights[:min_len]
+
+            # Return the unreduced per-token KL when kl_probe collection is on.
+            want_per_token = collect_per_token_kl
+
+            if loss_type == "reverse_kl":
+                fn = (
+                    self._compute_reverse_kl_loss_liger if use_liger
+                    else self._compute_reverse_kl_loss
+                )
+                result = fn(
+                    t_logits_aligned,
+                    s_logits_aligned,
+                    beta=beta,
+                    token_weights=mb_token_weights,
+                    return_per_token=want_per_token,
+                )
             else:
-                loss, n_tokens = fn_standard(t_logits_aligned, s_logits_aligned, beta=beta)
+                fn = fn_liger if use_liger else fn_standard
+                result = fn(t_logits_aligned, s_logits_aligned, beta=beta)
+
+            if isinstance(result, tuple) and len(result) == 3:
+                loss, n_tokens, per_token_kl = result
+            else:
+                loss, n_tokens = result
+                per_token_kl = None
+
+            if per_token_kl is not None:
+                # Detach to CPU float32 and accumulate. Each micro-batch contributes
+                # (min_len,) to the flat response-token sequence.
+                per_token_kl_chunks.append(per_token_kl.detach().float().cpu())
 
             # Compute entropy for both teacher and student (no grad needed)
             with torch.no_grad():
@@ -336,7 +401,7 @@ class OPSDWorker(SelfDistillWorker):
         avg_student_entropy = total_student_entropy / max(1, total_entropy_tokens)
         avg_teacher_entropy = total_teacher_entropy / max(1, total_entropy_tokens)
 
-        return {
+        metrics = {
             "opsd/loss": avg_loss,
             "opsd/grad_norm": grad_norm.detach().item(),
             "opsd/num_tokens": int(total_tokens),
@@ -347,6 +412,71 @@ class OPSDWorker(SelfDistillWorker):
             "opsd/teacher_entropy": avg_teacher_entropy,
             "opsd/entropy_diff": avg_student_entropy - avg_teacher_entropy,
         }
+
+        # kl_probe staging: write per-rank file for trainer to aggregate.
+        if collect_per_token_kl and per_token_kl_chunks:
+            staging_dir = data.meta_info.get("kl_probe_staging_dir")
+            step = int(data.meta_info.get("global_steps", 0))
+            if staging_dir:
+                try:
+                    os.makedirs(staging_dir, exist_ok=True)
+                    rank = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                        else 0
+                    )
+                    payload = {
+                        "per_token_kl_flat": torch.cat(per_token_kl_chunks, dim=0),
+                        "per_sample_lengths": torch.tensor(
+                            per_sample_lengths_shard, dtype=torch.long
+                        ),
+                        "shard_batch_indices": torch.tensor(
+                            per_sample_batch_indices_shard, dtype=torch.long
+                        ) if per_sample_batch_indices_shard else None,
+                        "step": step,
+                        "rank": rank,
+                    }
+                    path = os.path.join(staging_dir, f"step{step:06d}_rank{rank:02d}.pt")
+                    torch.save(payload, path)
+                    metrics["opsd/kl_probe_staged"] = 1.0
+                except Exception as e:
+                    logger.exception("KL probe staging write failed: %s", e)
+                    metrics["opsd/kl_probe_staged"] = 0.0
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Helper: extract response-aligned values from a (B, max_L) padded tensor
+    # using the same shift+mask logic as _forward_logits_padded. Used to
+    # derive a flat (N_response,) weight tensor from a (B, max_L) padded
+    # weights tensor without re-running the forward.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_response_values(
+        tensor_padded: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Flatten-and-select response-position values mirroring forward_logits.
+
+        Args:
+            tensor_padded: (B, max_L) values aligned with the student's input_ids
+                positions. tensor_padded[b, i] is the value associated with
+                student input_ids[b, i].
+            loss_mask: (B, max_L) 1-at-response-token positions (same semantics
+                as ``student_loss_mask``).
+
+        Returns:
+            (N,) flat tensor where N = number of response tokens in the
+            micro-batch, ordered identically to ``_forward_logits_*`` outputs.
+        """
+        shift_v = tensor_padded[:, 1:]
+        shift_mask = loss_mask[:, 1:]
+        B, S = shift_v.shape
+        flat_v = shift_v.reshape(B * S)
+        flat_mask = shift_mask.reshape(B * S)
+        response_indices = flat_mask.nonzero(as_tuple=True)[0]
+        return flat_v[response_indices]
 
     # ------------------------------------------------------------------
     # Forward logits: Padded path
@@ -650,7 +780,9 @@ class OPSDWorker(SelfDistillWorker):
         student_logits: torch.Tensor,
         beta: float = 0.5,
         chunk_size: int = 512,
-    ) -> tuple[torch.Tensor, int]:
+        token_weights: Optional[torch.Tensor] = None,
+        return_per_token: bool = False,
+    ):
         """Compute reverse KL divergence: KL(student || teacher).
 
         KL(p_S || p_T) = sum_x p_S(x) * [log p_S(x) - log p_T(x)]
@@ -660,23 +792,32 @@ class OPSDWorker(SelfDistillWorker):
         to adopt the teacher's concise reasoning style without spreading
         probability over tokens the teacher assigns low weight to.
 
-        The ``beta`` parameter is accepted for API compatibility with JSD
-        callers but is unused (reverse KL has no mixture parameter).
-
         Args:
             teacher_logits: (N, V) — logits from frozen teacher (no grad).
             student_logits: (N, V) — logits from trainable student (with grad).
             beta: Unused, kept for API compatibility with JSD.
             chunk_size: Number of tokens to process at a time.
+            token_weights: Optional (N,) float tensor. Per-token KL is
+                multiplied by these weights before reduction (used by
+                distance_weighted_kl). The denominator remains ``n_tokens``,
+                so the loss is mean-preserving when the trainer pre-normalizes
+                weights per-sample to sum to L_i.
+            return_per_token: If True, additionally return the unreduced
+                (N,) per-token KL tensor (detached, for kl_probe logging).
 
         Returns:
-            (loss, n_tokens) — scalar mean reverse-KL loss and token count.
+            (loss, n_tokens) or (loss, n_tokens, per_token_kl) if
+            ``return_per_token``.
         """
         n_tokens = teacher_logits.shape[0]
         if n_tokens == 0:
-            return torch.tensor(0.0, device=student_logits.device, requires_grad=True), 0
+            zero = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+            if return_per_token:
+                return zero, 0, torch.zeros(0, device=student_logits.device)
+            return zero, 0
 
         kl_sum = torch.tensor(0.0, device=student_logits.device)
+        per_token_parts = [] if return_per_token else None
 
         for start in range(0, n_tokens, chunk_size):
             end = min(start + chunk_size, n_tokens)
@@ -684,15 +825,23 @@ class OPSDWorker(SelfDistillWorker):
             t_log_probs = F.log_softmax(teacher_logits[start:end].float(), dim=-1)
             s_log_probs = F.log_softmax(student_logits[start:end].float(), dim=-1)
 
-            # KL(p_S || p_T) = sum p_S * (log p_S - log p_T)
             s_probs = s_log_probs.exp()
             kl_chunk = (s_probs * (s_log_probs - t_log_probs)).sum(dim=-1)
             del t_log_probs, s_log_probs, s_probs
+
+            if return_per_token:
+                per_token_parts.append(kl_chunk.detach())
+
+            if token_weights is not None:
+                kl_chunk = kl_chunk * token_weights[start:end]
 
             kl_sum = kl_sum + kl_chunk.sum()
             del kl_chunk
 
         loss = kl_sum / n_tokens
+        if return_per_token:
+            per_token_kl = torch.cat(per_token_parts, dim=0)
+            return loss, n_tokens, per_token_kl
         return loss, n_tokens
 
     @staticmethod
@@ -701,29 +850,30 @@ class OPSDWorker(SelfDistillWorker):
         student_logits: torch.Tensor,
         beta: float = 0.5,
         chunk_size: int = 256,
-    ) -> tuple[torch.Tensor, int]:
+        token_weights: Optional[torch.Tensor] = None,
+        return_per_token: bool = False,
+    ):
         """Memory-efficient reverse KL: KL(student || teacher).
 
         Same as ``_compute_reverse_kl_loss`` but with progressive teacher
         freeing (clone teacher chunks, delete original) for lower peak memory.
 
-        Args:
-            teacher_logits: (N, V) — logits from frozen teacher (no grad).
-            student_logits: (N, V) — logits from trainable student (with grad).
-            beta: Unused, kept for API compatibility with JSD.
-            chunk_size: Number of tokens per chunk.
-
-        Returns:
-            (loss, n_tokens) — scalar mean reverse-KL loss and token count.
+        See :meth:`_compute_reverse_kl_loss` for full arg/return docstring —
+        the ``token_weights`` and ``return_per_token`` arguments behave
+        identically here.
         """
         n_tokens = teacher_logits.shape[0]
         if n_tokens == 0:
-            return torch.tensor(0.0, device=student_logits.device, requires_grad=True), 0
+            zero = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+            if return_per_token:
+                return zero, 0, torch.zeros(0, device=student_logits.device)
+            return zero, 0
 
         teacher_chunks = [c.clone() for c in teacher_logits.split(chunk_size, dim=0)]
         del teacher_logits
 
         kl_sum = torch.tensor(0.0, device=student_logits.device)
+        per_token_parts = [] if return_per_token else None
 
         for i, t_chunk in enumerate(teacher_chunks):
             start = i * chunk_size
@@ -734,16 +884,23 @@ class OPSDWorker(SelfDistillWorker):
             del t_chunk
             teacher_chunks[i] = None
 
-            # KL(p_S || p_T) via F.kl_div(input=log_p_T, target=log_p_S, log_target=True)
-            # F.kl_div with log_target=True computes: exp(target) * (target - input)
-            # i.e. sum p_S * (log p_S - log p_T) = KL(p_S || p_T)
+            # KL(p_S || p_T) = sum p_S * (log p_S - log p_T)
             kl_chunk = F.kl_div(t_lp, s_lp, reduction="none", log_target=True).sum(dim=-1)
             del t_lp, s_lp
+
+            if return_per_token:
+                per_token_parts.append(kl_chunk.detach())
+
+            if token_weights is not None:
+                kl_chunk = kl_chunk * token_weights[start:end]
 
             kl_sum = kl_sum + kl_chunk.sum()
             del kl_chunk
 
         loss = kl_sum / n_tokens
+        if return_per_token:
+            per_token_kl = torch.cat(per_token_parts, dim=0)
+            return loss, n_tokens, per_token_kl
         return loss, n_tokens
 
     # ------------------------------------------------------------------
