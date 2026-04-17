@@ -55,6 +55,7 @@ DISTANCE_WEIGHT_ALPHA=${DISTANCE_WEIGHT_ALPHA:-2.0}
 
 # ---- teacher_ctx_reinjection ----
 REINJECTION_ENABLED=${REINJECTION_ENABLED:-false}
+REINJECTION_MODE=${REINJECTION_MODE:-cumulative}   # cumulative | multi_pass
 REINJECTION_INTERVAL=${REINJECTION_INTERVAL:-2048}
 REINJECTION_CONTENT=${REINJECTION_CONTENT:-specific_context}
 
@@ -101,5 +102,6 @@ bash workspace/scripts/sft/train_opsd.sh \
     opsd.distance_weighting.late_multiplier=$DISTANCE_WEIGHT_LATE_MULT \
     opsd.distance_weighting.alpha=$DISTANCE_WEIGHT_ALPHA \
     opsd.teacher_ctx_reinjection.enabled=$REINJECTION_ENABLED \
+    opsd.teacher_ctx_reinjection.mode=$REINJECTION_MODE \
     opsd.teacher_ctx_reinjection.interval=$REINJECTION_INTERVAL \
     opsd.teacher_ctx_reinjection.content=$REINJECTION_CONTENT

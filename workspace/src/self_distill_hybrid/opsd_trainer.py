@@ -46,7 +46,12 @@ from .kl_probe import (
     find_think_close,
     snap_to_boundary,
 )
-from .sd_verifier import build_opsd_batch, build_sft_batch, verify_batch
+from .sd_verifier import (
+    build_opsd_batch,
+    build_opsd_batch_multipass,
+    build_sft_batch,
+    verify_batch,
+)
 
 py_logger = logging.getLogger(__name__)
 
@@ -158,11 +163,15 @@ class OPSDTrainer:
         self.reinjection_interval = int(rj_cfg.get("interval", 2048))
         self.reinjection_content = str(rj_cfg.get("content", "specific_context"))
         self.reinjection_wrapper = str(rj_cfg.get("wrapper", "natural"))
+        self.reinjection_mode = str(rj_cfg.get("mode", "cumulative"))
         assert self.reinjection_content in (
             "specific_context", "conciseness_instruction",
         ), f"Invalid reinjection content: {self.reinjection_content}"
         assert self.reinjection_wrapper == "natural", (
             f"Only wrapper=natural is supported (got {self.reinjection_wrapper})"
+        )
+        assert self.reinjection_mode in ("cumulative", "multi_pass"), (
+            f"Invalid reinjection_mode: {self.reinjection_mode}"
         )
 
         # Detailed logging
@@ -1469,33 +1478,40 @@ class OPSDTrainer:
         self,
         responses: list[str],
         ctx_texts: list[Optional[str]],
-    ) -> tuple[list[Optional[list[int]]], list[Optional[set[int]]]]:
-        """For each sample, produce (snippet_ids, positions) or (None, None).
+    ) -> tuple[list[Optional[list[int]]], list[Optional[set[int]]], list[Optional[list[int]]]]:
+        """For each sample, produce (snippet_ids, positions_set, positions_sorted)
+        or (None, None, None).
 
-        Used by ``build_opsd_batch`` to interleave snippets into teacher
-        sequences. When reinjection is disabled globally, or when a snippet
-        can't be constructed for a sample, the sample passes through unchanged.
+        - ``positions_set``: consumed by the cumulative path (``build_opsd_batch``),
+          which uses ``s_t in positions`` lookups during interleave.
+        - ``positions_sorted``: consumed by the multi_pass path, which needs
+          segment boundaries in ascending order.
         """
         if not self.reinjection_enabled:
-            return [None] * len(responses), [None] * len(responses)
+            n = len(responses)
+            return [None] * n, [None] * n, [None] * n
 
         snippet_list: list[Optional[list[int]]] = []
-        positions_list: list[Optional[set[int]]] = []
+        positions_set_list: list[Optional[set[int]]] = []
+        positions_sorted_list: list[Optional[list[int]]] = []
         for resp, ctx in zip(responses, ctx_texts):
             snippet_text = self._build_reinject_snippet_text(ctx)
             if not snippet_text:
                 snippet_list.append(None)
-                positions_list.append(None)
+                positions_set_list.append(None)
+                positions_sorted_list.append(None)
                 continue
             snippet_ids = self.tokenizer.encode(snippet_text, add_special_tokens=False)
             positions, _ = self._build_reinject_positions(resp)
             if not positions:
                 snippet_list.append(None)
-                positions_list.append(None)
+                positions_set_list.append(None)
+                positions_sorted_list.append(None)
                 continue
             snippet_list.append(snippet_ids)
-            positions_list.append(positions)
-        return snippet_list, positions_list
+            positions_set_list.append(positions)
+            positions_sorted_list.append(sorted(positions))
+        return snippet_list, positions_set_list, positions_sorted_list
 
     def _resolve_ctx_texts_for_reinjection(
         self,
@@ -1604,8 +1620,10 @@ class OPSDTrainer:
         if not files:
             return
 
-        # Gather (shard_batch_idx → (kl_array, length)) across ranks.
-        per_sample: dict[int, tuple[np.ndarray, int]] = {}
+        # Gather all (shard_batch_idx, segment_idx, kl_array, L) tuples across ranks.
+        # In cumulative mode: exactly one row per sample (segment_idx=0).
+        # In multi-pass mode: K_i+1 rows per sample; need to re-merge by sample.
+        all_rows: list[tuple[int, int, np.ndarray, int]] = []
         for path in files:
             try:
                 payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -1615,55 +1633,69 @@ class OPSDTrainer:
             flat = payload.get("per_token_kl_flat")
             lengths = payload.get("per_sample_lengths")
             batch_idx = payload.get("shard_batch_indices")
+            segment_idx_t = payload.get("segment_indices")
             if flat is None or lengths is None:
                 continue
             flat_np = flat.detach().float().cpu().numpy()
             lens = [int(x) for x in lengths.tolist()]
-            # Split flat → per-sample arrays by length.
+            b_idx = batch_idx.tolist() if batch_idx is not None else [-1] * len(lens)
+            s_idx = segment_idx_t.tolist() if segment_idx_t is not None else [0] * len(lens)
+            # Split flat → per-row arrays by length.
             cursor = 0
             for i, L in enumerate(lens):
                 if L <= 0:
                     continue
                 arr = flat_np[cursor : cursor + L].copy()
                 cursor += L
-                if batch_idx is not None and i < len(batch_idx):
-                    idx = int(batch_idx[i].item())
-                else:
-                    idx = -1  # unknown — fallback to sequential match
-                per_sample[idx] = (arr, L)
-            # Cleanup the file after consumption.
+                idx = int(b_idx[i]) if i < len(b_idx) else -1
+                seg = int(s_idx[i]) if i < len(s_idx) else 0
+                all_rows.append((idx, seg, arr, L))
             try:
                 os.remove(path)
             except OSError:
                 pass
 
-        if not per_sample:
+        if not all_rows:
             return
 
-        # Order by shard_batch_idx when available; else accept iteration order.
-        ordered_items = sorted(per_sample.items(), key=lambda kv: kv[0])
+        # Group rows by sample_idx, sort each group by segment_idx, concat KL arrays.
+        by_sample: dict[int, list[tuple[int, np.ndarray, int]]] = {}
+        for sample_idx, segment_idx, arr, L in all_rows:
+            if sample_idx < 0 or sample_idx >= len(active_correct_mask):
+                # Padding-row sentinel (-1) or out-of-range index: skip.
+                continue
+            by_sample.setdefault(sample_idx, []).append((segment_idx, arr, L))
+
+        if not by_sample:
+            return
+
+        # Emit one per-sample entry, sorted by sample_idx for deterministic order.
         kl_arrays: list[np.ndarray] = []
-        lengths: list[int] = []
+        lengths_list: list[int] = []
         correct: list[bool] = []
         truncated: list[bool] = []
-        for idx, (arr, L) in ordered_items:
-            if 0 <= idx < len(active_correct_mask):
-                correct.append(bool(active_correct_mask[idx]))
-                truncated.append(bool(active_truncated_mask[idx]))
-            else:
-                # Fallback: unknown index → skip (conservative; avoids mislabeling).
+        for sample_idx in sorted(by_sample.keys()):
+            segments = sorted(by_sample[sample_idx], key=lambda t: t[0])
+            seg_arrays = [arr for _, arr, _ in segments]
+            seg_lens = [L for _, _, L in segments]
+            per_sample_flat = (
+                np.concatenate(seg_arrays, axis=0) if seg_arrays else np.zeros(0, np.float32)
+            )
+            total_len = int(sum(seg_lens))
+            if total_len <= 0:
                 continue
-            kl_arrays.append(arr)
-            lengths.append(L)
+            kl_arrays.append(per_sample_flat)
+            lengths_list.append(total_len)
+            correct.append(bool(active_correct_mask[sample_idx]))
+            truncated.append(bool(active_truncated_mask[sample_idx]))
 
         if not kl_arrays:
             return
 
-        # Feed to accumulator as one synthetic "step" — flat KL ordered by sample.
-        flat_cat = np.concatenate(kl_arrays, axis=0) if kl_arrays else np.zeros(0, np.float32)
+        flat_cat = np.concatenate(kl_arrays, axis=0)
         self.kl_probe.add_step(
             torch.from_numpy(flat_cat),
-            student_lengths=lengths,
+            student_lengths=lengths_list,
             correct_mask=correct,
             truncated_mask=truncated,
         )
@@ -1728,38 +1760,74 @@ class OPSDTrainer:
         ctx_texts = self._resolve_ctx_texts_for_reinjection(
             student_prompts, ground_truths, epiphanies,
         )
-        teacher_reinject_snippets, teacher_reinject_positions = self._build_reinjection_arrays(
-            responses, ctx_texts,
-        )
-        n_reinjected = sum(1 for p in teacher_reinject_positions if p)
+        (
+            teacher_reinject_snippets,
+            teacher_reinject_positions_set,
+            teacher_reinject_positions_sorted,
+        ) = self._build_reinjection_arrays(responses, ctx_texts)
+        n_reinjected = sum(1 for p in teacher_reinject_positions_sorted if p)
 
-        opsd_batch = build_opsd_batch(
-            teacher_prompts=teacher_prompts,
-            student_prompts=student_prompts,
-            responses=responses,
-            tokenizer=self.tokenizer,
-            max_length=self.sft_max_length,
-            teacher_reinject_snippets=teacher_reinject_snippets,
-            teacher_reinject_positions=teacher_reinject_positions,
+        # ---- Branch: cumulative (one row per sample) vs multi_pass (K+1 rows per sample) ----
+        multipass = (
+            self.reinjection_enabled
+            and self.reinjection_mode == "multi_pass"
         )
 
-        if opsd_batch is None:
-            return {"opsd/loss": 0.0, "opsd/skipped": 1.0}
+        if multipass:
+            built = build_opsd_batch_multipass(
+                teacher_prompts=teacher_prompts,
+                student_prompts=student_prompts,
+                responses=responses,
+                tokenizer=self.tokenizer,
+                max_length=self.sft_max_length,
+                reinject_snippets=teacher_reinject_snippets,
+                reinject_positions=teacher_reinject_positions_sorted,
+            )
+            if built is None:
+                return {"opsd/loss": 0.0, "opsd/skipped": 1.0}
+            opsd_batch, row_sample_idx, row_segment_idx = built
+            n_rows = opsd_batch.batch["student_input_ids"].shape[0]
+            # In multi-pass the "shard_batch_idx" identifies the ORIGINAL sample
+            # this row belongs to; a segment_idx within tracks segment ordering
+            # for kl_probe reconstruction.
+            if self.kl_probe_cfg.enabled:
+                opsd_batch.batch["shard_batch_idx"] = torch.tensor(
+                    row_sample_idx, dtype=torch.long
+                )
+                opsd_batch.batch["segment_idx"] = torch.tensor(
+                    row_segment_idx, dtype=torch.long
+                )
+        else:
+            opsd_batch = build_opsd_batch(
+                teacher_prompts=teacher_prompts,
+                student_prompts=student_prompts,
+                responses=responses,
+                tokenizer=self.tokenizer,
+                max_length=self.sft_max_length,
+                teacher_reinject_snippets=teacher_reinject_snippets,
+                teacher_reinject_positions=teacher_reinject_positions_set,
+            )
+            if opsd_batch is None:
+                return {"opsd/loss": 0.0, "opsd/skipped": 1.0}
+            n_rows = opsd_batch.batch["student_input_ids"].shape[0]
+            if self.kl_probe_cfg.enabled:
+                opsd_batch.batch["shard_batch_idx"] = torch.arange(
+                    n_rows, dtype=torch.long
+                )
+                opsd_batch.batch["segment_idx"] = torch.zeros(n_rows, dtype=torch.long)
 
-        n_samples = opsd_batch.batch["student_input_ids"].shape[0]
+        n_samples = n_rows  # legacy name; now may be row count in multi-pass
 
         # ---- Distance-weighting: build (B, max_L) padded weights tensor ----
+        # In multi-pass, weights are computed per ROW using the row's loss_mask
+        # (which is already gated to the current segment). Since each sample's
+        # segments together cover the full response, per-sample normalization
+        # is still valid at row level.
         kl_weights_padded = self._build_kl_token_weights_padded(
             opsd_batch.batch["student_loss_mask"]
         )
         if kl_weights_padded is not None:
             opsd_batch.batch["kl_token_weights_padded"] = kl_weights_padded
-
-        # ---- shard_batch_idx: identity index for kl_probe alignment ----
-        if self.kl_probe_cfg.enabled:
-            opsd_batch.batch["shard_batch_idx"] = torch.arange(
-                n_samples, dtype=torch.long
-            )
 
         # DP-pad: ensure batch is divisible by number of DP workers
         n_dp = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
@@ -1771,11 +1839,17 @@ class OPSDTrainer:
                 tensor = opsd_batch.batch[key]
                 last = tensor[-1:].expand(pad_count, *tensor.shape[1:]).clone()
                 padded_dict[key] = torch.cat([tensor, last], dim=0)
-            # shard_batch_idx for padding rows: -1 sentinel (won't match any active sample)
+            # Sentinels for padding rows: -1 for shard_batch_idx (won't match any
+            # active sample) and segment_idx (marks pad row).
             if "shard_batch_idx" in padded_dict:
                 sentinel = torch.full((pad_count,), -1, dtype=torch.long)
                 padded_dict["shard_batch_idx"] = torch.cat(
                     [opsd_batch.batch["shard_batch_idx"], sentinel], dim=0,
+                )
+            if "segment_idx" in padded_dict:
+                sentinel = torch.full((pad_count,), -1, dtype=torch.long)
+                padded_dict["segment_idx"] = torch.cat(
+                    [opsd_batch.batch["segment_idx"], sentinel], dim=0,
                 )
             opsd_batch = DataProto.from_single_dict(padded_dict)
             py_logger.debug(
@@ -1793,9 +1867,11 @@ class OPSDTrainer:
             opsd_batch.meta_info["global_steps"] = int(self.global_steps)
 
         py_logger.info(
-            "Step %d: OPSD update with %d samples (beta=%.2f, loss=%s, reinject=%d, dw=%s)",
+            "Step %d: OPSD update with %d rows (beta=%.2f, loss=%s, reinject=%d, mode=%s, dw=%s)",
             self.global_steps, n_samples, self.beta, self.loss_type,
-            n_reinjected, self.distance_weight_schedule,
+            n_reinjected,
+            self.reinjection_mode if self.reinjection_enabled else "off",
+            self.distance_weight_schedule,
         )
 
         # Dispatch to workers
@@ -1805,6 +1881,9 @@ class OPSDTrainer:
         opsd_metrics = reduce_metrics(opsd_output.meta_info["metrics"])
         opsd_metrics["opsd/n_samples"] = n_samples
         opsd_metrics["opsd/n_reinjected"] = n_reinjected
+        opsd_metrics["opsd/reinjection_mode"] = (
+            self.reinjection_mode if self.reinjection_enabled else "off"
+        )
         opsd_metrics["opsd/distance_weighting"] = self.distance_weight_schedule
         return opsd_metrics
 

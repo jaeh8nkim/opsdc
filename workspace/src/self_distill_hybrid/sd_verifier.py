@@ -285,6 +285,213 @@ def _tokenize_sequence(
     }
 
 
+def _tokenize_segment(
+    prompt_str: str,
+    response_ids_with_eos: list[int],
+    segment_start: int,
+    segment_end: int,
+    snippet_ids: Optional[list[int]],
+    tokenizer: PreTrainedTokenizer,
+    max_length: int,
+    pad_token_id: int,
+    is_teacher: bool,
+) -> Optional[dict]:
+    """Tokenize one segment of one sample for multi-pass reinjection.
+
+    For multi-pass, each sample is expanded into K+1 rows (one per segment).
+    Each row gates the loss to ONLY the segment's response tokens via loss_mask,
+    so the forward path naturally yields logits for just that segment.
+
+    Args:
+        prompt_str: JSON chat messages.
+        response_ids_with_eos: fully tokenized response, EOS appended.
+        segment_start: first response-token index that this segment covers (inclusive).
+        segment_end: one-past-last response-token index (exclusive). Segment covers
+            response[segment_start:segment_end].
+        snippet_ids: teacher-only snippet to insert RIGHT BEFORE segment_start.
+            Empty/None for segment 0 (no prior reinjection). Ignored when
+            ``is_teacher=False`` (student never sees snippets).
+        is_teacher: True → teacher frame (may contain snippet). False → student
+            frame (full response unchanged, no snippet).
+
+    Returns:
+        dict with input_ids, attention_mask, position_ids, loss_mask;
+        None if the sequence is too short.
+
+    Shape invariant: the loss_mask marks exactly ``segment_end - segment_start``
+    positions across the output (one per response token in this segment). The
+    forward path extracts one logit per marked position, so both teacher and
+    student rows of the same segment contribute the same count of response
+    logits — aligned 1:1 across the pair.
+    """
+    messages = json.loads(prompt_str)
+    prompt_ids = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True
+    )
+
+    if is_teacher:
+        # Teacher body: pre-segment response context + snippet + segment tokens.
+        # Tokens AFTER segment_end are intentionally omitted — the teacher doesn't
+        # need to produce logits for those in this row.
+        pre = list(response_ids_with_eos[:segment_start])
+        seg_tokens = list(response_ids_with_eos[segment_start:segment_end])
+        snip = list(snippet_ids) if snippet_ids else []
+        body_ids = pre + snip + seg_tokens
+        body_loss = [0] * len(pre) + [0] * len(snip) + [1] * len(seg_tokens)
+    else:
+        # Student: full response, loss_mask=1 only at the segment's response tokens.
+        body_ids = list(response_ids_with_eos)
+        body_loss = [0] * len(body_ids)
+        for p in range(segment_start, segment_end):
+            body_loss[p] = 1
+
+    full_ids = prompt_ids + body_ids
+    loss_mask = [0] * len(prompt_ids) + body_loss
+
+    if len(full_ids) > max_length:
+        full_ids = full_ids[:max_length]
+        loss_mask = loss_mask[:max_length]
+
+    seq_len = len(full_ids)
+    if seq_len < 2:
+        return None
+
+    pad_len = max_length - seq_len
+    return {
+        "input_ids": torch.tensor(full_ids + [pad_token_id] * pad_len, dtype=torch.long),
+        "attention_mask": torch.tensor([1] * seq_len + [0] * pad_len, dtype=torch.long),
+        "position_ids": torch.tensor(list(range(seq_len)) + [0] * pad_len, dtype=torch.long),
+        "loss_mask": torch.tensor(loss_mask + [0] * pad_len, dtype=torch.float32),
+    }
+
+
+def _tokenize_response_with_eos(
+    response_text: str,
+    tokenizer: PreTrainedTokenizer,
+) -> list[int]:
+    """Tokenize response and append EOS if missing (matches _tokenize_sequence)."""
+    ids = tokenizer.encode(response_text, add_special_tokens=False)
+    if not ids or ids[-1] != tokenizer.eos_token_id:
+        ids = ids + [tokenizer.eos_token_id]
+    return ids
+
+
+def build_opsd_batch_multipass(
+    teacher_prompts: list[str],
+    student_prompts: list[str],
+    responses: list[str],
+    tokenizer: PreTrainedTokenizer,
+    max_length: int = 32768,
+    reinject_snippets: Optional[list[Optional[list[int]]]] = None,
+    reinject_positions: Optional[list[Optional[list[int]]]] = None,
+) -> Optional[tuple[DataProto, list[int], list[int]]]:
+    """Build expanded (per-segment) OPSD batch for multi-pass reinjection.
+
+    Each sample with K reinjection positions is expanded into K+1 rows. Segment
+    k covers response tokens [b_k .. b_{k+1} - 1] where b_0=0, b_k=r_k for
+    k=1..K, b_{K+1}=L_response.
+
+    Per row:
+      - Teacher input = [prompt, ctx, <think>, response[0..b_k-1] +
+        snippet_k (if k>0) + response[b_k..b_{k+1}-1]]. Note: no prior snippets
+        remain in context — earlier reinjections are discarded (the
+        replacement semantics).
+      - Student input = [prompt_student, full response].
+      - Both loss_masks = 1 only at response[b_k..b_{k+1}-1] positions.
+
+    Returns:
+        Tuple of (DataProto, shard_batch_idx, segment_idx) where:
+          - DataProto has (N_expanded, max_L) tensors.
+          - shard_batch_idx: list of length N_expanded, entry i = original
+            sample index this row belongs to.
+          - segment_idx: list of length N_expanded, entry i = segment number
+            for this row within its sample (0..K).
+        Or None if no valid samples.
+    """
+    if not teacher_prompts:
+        return None
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+
+    n = len(teacher_prompts)
+    if reinject_snippets is None:
+        reinject_snippets = [None] * n
+    if reinject_positions is None:
+        reinject_positions = [None] * n
+
+    teacher_seqs = []
+    student_seqs = []
+    shard_batch_idx: list[int] = []
+    segment_idx: list[int] = []
+    skipped_samples = 0
+
+    for sample_i, (t_prompt, s_prompt, response_text, snippet_ids, positions) in enumerate(zip(
+        teacher_prompts, student_prompts, responses,
+        reinject_snippets, reinject_positions,
+    )):
+        response_ids = _tokenize_response_with_eos(response_text, tokenizer)
+        L_resp = len(response_ids)
+        if L_resp < 2:
+            skipped_samples += 1
+            continue
+
+        # Segment boundaries: b_0=0, b_1..b_K=positions, b_{K+1}=L_resp.
+        sorted_positions = sorted(int(p) for p in (positions or []) if 0 < int(p) < L_resp)
+        boundaries = [0] + sorted_positions + [L_resp]
+
+        sample_rows_teacher = []
+        sample_rows_student = []
+        sample_rows_meta = []
+        sample_ok = True
+        for k in range(len(boundaries) - 1):
+            seg_start = boundaries[k]
+            seg_end = boundaries[k + 1]
+            if seg_end <= seg_start:
+                continue  # skip degenerate empty segments
+            snip_for_segment = snippet_ids if k > 0 and snippet_ids else None
+            t_row = _tokenize_segment(
+                t_prompt, response_ids, seg_start, seg_end, snip_for_segment,
+                tokenizer, max_length, pad_token_id, is_teacher=True,
+            )
+            s_row = _tokenize_segment(
+                s_prompt, response_ids, seg_start, seg_end, None,
+                tokenizer, max_length, pad_token_id, is_teacher=False,
+            )
+            if t_row is None or s_row is None:
+                sample_ok = False
+                break
+            sample_rows_teacher.append(t_row)
+            sample_rows_student.append(s_row)
+            sample_rows_meta.append(k)
+
+        if not sample_ok or not sample_rows_teacher:
+            skipped_samples += 1
+            continue
+
+        teacher_seqs.extend(sample_rows_teacher)
+        student_seqs.extend(sample_rows_student)
+        shard_batch_idx.extend([sample_i] * len(sample_rows_teacher))
+        segment_idx.extend(sample_rows_meta)
+
+    if skipped_samples:
+        logger.warning(
+            "Skipped %d samples during multi-pass OPSD batch construction",
+            skipped_samples,
+        )
+
+    if not teacher_seqs:
+        return None
+
+    batch_dict = {}
+    for prefix, seqs in [("teacher_", teacher_seqs), ("student_", student_seqs)]:
+        for key in ["input_ids", "attention_mask", "position_ids", "loss_mask"]:
+            batch_dict[f"{prefix}{key}"] = torch.stack([s[key] for s in seqs])
+
+    return DataProto.from_single_dict(batch_dict), shard_batch_idx, segment_idx
+
+
 def build_opsd_batch(
     teacher_prompts: list[str],
     student_prompts: list[str],

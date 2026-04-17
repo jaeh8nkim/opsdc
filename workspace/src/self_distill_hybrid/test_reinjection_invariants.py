@@ -33,7 +33,11 @@ import pytest
 import torch
 
 from self_distill_hybrid.kl_probe import find_think_close, snap_to_boundary
-from self_distill_hybrid.sd_verifier import _tokenize_sequence
+from self_distill_hybrid.sd_verifier import (
+    _tokenize_sequence,
+    _tokenize_segment,
+    _tokenize_response_with_eos,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +327,100 @@ def test_multi_reinjection_ordering(tokenizer, simple_prompt, simple_response, s
     assert snippet_count == len(positions), (
         f"expected {len(positions)} snippet occurrences, got {snippet_count}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 6: multi-pass segment invariants
+# ---------------------------------------------------------------------------
+
+
+def test_multipass_segment_coverage_disjoint(tokenizer, simple_prompt, simple_response, snippet_ids):
+    """For a sample with K reinjections, the K+1 student-segment loss_masks
+    must partition exactly the full response (non-overlapping and covering).
+    """
+    response_ids = _tokenize_response_with_eos(simple_response, tokenizer)
+    L = len(response_ids)
+    positions = sorted([2, 4])
+    boundaries = [0] + positions + [L]
+
+    covered = set()
+    for k in range(len(boundaries) - 1):
+        s_row = _tokenize_segment(
+            simple_prompt, response_ids, boundaries[k], boundaries[k + 1],
+            snippet_ids=None, tokenizer=tokenizer, max_length=512,
+            pad_token_id=tokenizer.pad_token_id, is_teacher=False,
+        )
+        assert s_row is not None
+        # Loss-mask=1 count should equal segment length.
+        n_marked = int(s_row["loss_mask"].sum())
+        expected = boundaries[k + 1] - boundaries[k]
+        assert n_marked == expected, f"segment {k}: {n_marked} != {expected}"
+
+        # Positions in input_ids that carry loss_mask=1 should be disjoint
+        # across segments (different k).
+        idxs = set(s_row["loss_mask"].nonzero(as_tuple=True)[0].tolist())
+        assert not (idxs & covered), f"segment {k} overlaps earlier segments"
+        covered |= idxs
+
+    # Total count covers exactly the response.
+    assert len(covered) == L
+
+
+def test_multipass_teacher_segment_loss_mask_count(
+    tokenizer, simple_prompt, simple_response, snippet_ids,
+):
+    """Teacher segment's loss_mask=1 count == segment length (even with snippet)."""
+    response_ids = _tokenize_response_with_eos(simple_response, tokenizer)
+    L = len(response_ids)
+
+    # Segment 1 (with snippet): response[3..6]
+    t_row = _tokenize_segment(
+        simple_prompt, response_ids, segment_start=3, segment_end=6,
+        snippet_ids=snippet_ids, tokenizer=tokenizer, max_length=512,
+        pad_token_id=tokenizer.pad_token_id, is_teacher=True,
+    )
+    assert t_row is not None
+    assert int(t_row["loss_mask"].sum()) == 3, "segment length 3 → 3 loss_mask=1 positions"
+
+    # Segment 0 (no snippet): response[0..3]
+    t_row0 = _tokenize_segment(
+        simple_prompt, response_ids, segment_start=0, segment_end=3,
+        snippet_ids=None, tokenizer=tokenizer, max_length=512,
+        pad_token_id=tokenizer.pad_token_id, is_teacher=True,
+    )
+    assert t_row0 is not None
+    assert int(t_row0["loss_mask"].sum()) == 3
+
+
+def test_multipass_teacher_segment_has_no_prior_snippets(
+    tokenizer, simple_prompt, simple_response, snippet_ids,
+):
+    """Crucial replacement-semantics check: segment k's teacher input has the
+    current snippet right before segment start, but NO prior snippets in it.
+    We verify by counting snippet token sequences in the teacher input.
+    """
+    response_ids = _tokenize_response_with_eos(simple_response, tokenizer)
+
+    # Build segment 2 (imagine reinject at positions 2 and 4 → segment 2 covers
+    # response[4..end], current snippet is the segment-2 snippet).
+    t_row = _tokenize_segment(
+        simple_prompt, response_ids, segment_start=4, segment_end=len(response_ids),
+        snippet_ids=snippet_ids, tokenizer=tokenizer, max_length=1024,
+        pad_token_id=tokenizer.pad_token_id, is_teacher=True,
+    )
+    assert t_row is not None
+    input_ids = t_row["input_ids"].tolist()
+
+    # Count how many times snippet_ids appears contiguously.
+    n_occ = 0
+    i = 0
+    while i <= len(input_ids) - len(snippet_ids):
+        if input_ids[i : i + len(snippet_ids)] == snippet_ids:
+            n_occ += 1
+            i += len(snippet_ids)
+        else:
+            i += 1
+    assert n_occ == 1, f"expected 1 snippet (current only), got {n_occ}"
 
 
 if __name__ == "__main__":

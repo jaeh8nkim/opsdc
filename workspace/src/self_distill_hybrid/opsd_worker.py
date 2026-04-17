@@ -231,6 +231,10 @@ class OPSDWorker(SelfDistillWorker):
         # / truncation masks after DP sharding). Each sample in the shard has an
         # integer batch index; we track them per micro-batch.
         per_sample_batch_indices_shard: list[int] = []
+        # Segment index within each sample (multi-pass reinjection). 0 for
+        # single-row samples (cumulative mode) and for samples without
+        # reinjection. Same length as per_sample_batch_indices_shard.
+        per_sample_segment_indices_shard: list[int] = []
 
         # Distance-weighting token weights (padded) — optional input batch field.
         has_token_weights = "kl_token_weights_padded" in data.batch.keys()
@@ -259,6 +263,10 @@ class OPSDWorker(SelfDistillWorker):
                 if "shard_batch_idx" in micro_batch.batch.keys():
                     per_sample_batch_indices_shard.extend(
                         micro_batch.batch["shard_batch_idx"].cpu().tolist()
+                    )
+                if "segment_idx" in micro_batch.batch.keys():
+                    per_sample_segment_indices_shard.extend(
+                        micro_batch.batch["segment_idx"].cpu().tolist()
                     )
 
             # Teacher forward (frozen, no grad)
@@ -434,6 +442,9 @@ class OPSDWorker(SelfDistillWorker):
                         "shard_batch_indices": torch.tensor(
                             per_sample_batch_indices_shard, dtype=torch.long
                         ) if per_sample_batch_indices_shard else None,
+                        "segment_indices": torch.tensor(
+                            per_sample_segment_indices_shard, dtype=torch.long
+                        ) if per_sample_segment_indices_shard else None,
                         "step": step,
                         "rank": rank,
                     }

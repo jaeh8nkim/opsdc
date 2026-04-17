@@ -204,19 +204,27 @@ opsd:
   # ---- teacher_ctx_reinjection (arms B1/B2) ----
   # Interleave a natural-language mid-thinking snippet into the teacher input
   # sequence at sentence-boundary-snapped positions derived from ``interval``.
-  # Fires only while inside <think>; stops at </think>. Cumulative: all prior
-  # snippets remain in the teacher's causal context (standard attention).
+  # Fires only while inside <think>; stops at </think>.
+  #
+  # mode:
+  #   cumulative — single forward pass; all prior snippets remain in the
+  #     teacher's causal context. Cheapest (1× teacher compute).
+  #   multi_pass — each sample with K reinjections is expanded into K+1 rows;
+  #     each row's teacher input reconstructs the sequence with ONLY the
+  #     current snippet (prior snippets discarded). "Replacement" semantics
+  #     at (K+1)× teacher AND student compute.
   #
   # content:
-  #   specific_context        — inject the full ctx text (B1 arm — re-assert the
-  #                             same ctx that was originally prepended before
-  #                             reasoning started).
+  #   specific_context        — inject the full ctx text (B1 arm — re-assert
+  #                             the same ctx that was originally prepended
+  #                             before reasoning started).
   #   conciseness_instruction — hardcoded generic compression directive (B2
   #                             arm — tests whether a content-free nudge
   #                             suffices).
   # wrapper: only "natural" — "Actually, I recall: {...}. Continuing from this."
   teacher_ctx_reinjection:
     enabled: false
+    mode: cumulative                  # cumulative | multi_pass
     interval: 2048                    # snap back to last sentence before k * interval
     content: specific_context         # specific_context | conciseness_instruction
     wrapper: natural
