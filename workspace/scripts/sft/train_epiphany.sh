@@ -24,17 +24,20 @@
 #
 # Usage:
 #   MODEL_PATH=Qwen/Qwen3-8B ./workspace/scripts/sft/train_epiphany.sh
+#   KL_GATING=correct_only REINJECTION_ENABLED=true REINJECTION_MODE=cumulative MODEL_PATH=Qwen/Qwen3-8B ./workspace/scripts/sft/train_epiphany.sh
 
 SD_MAX_TOKENS=8192
 TURN2_MAX_TOKENS=8192
 TURN2_RESCUE_TOKENS=2048
 TURN2_TEACHER_CTX_TOKENS=null
+
 TEACHER_CTX_MODE=${TEACHER_CTX_MODE:-reflection_from_gt}
 # TEACHER_CTX_MODE options:
 #   sd_prompt          — use precomputed sd_prompt from dataset (no Turn 2)
 #   reflection_from_gt — Turn 2 self-reflection memo as teacher context
 #   gt_directly        — ground truth as teacher context (no Turn 2)
 #   conciseness_instruction — conciseness instruction only (no Turn 2, matches train_opsdc.sh)
+
 KL_GATING=${KL_GATING:-all}
 # KL_GATING options:
 #   all                    — KL on every sample
@@ -43,21 +46,27 @@ KL_GATING=${KL_GATING:-all}
 #   incorrect_only         — KL only on incorrect rollouts
 EXPERT_DEMO_PATH=${EXPERT_DEMO_PATH:-./workspace/data/expert_demonstrations/expert_demos_3200.parquet}
 
-# ---- KL-by-position probe ----
+# KL-by-position probe:
 KL_POS_LOGGING=${KL_POS_LOGGING:-true}
 KL_ANALYZE_ONLY=${KL_ANALYZE_ONLY:-false}
 PLOT_FREQ=${PLOT_FREQ:-50}
 
-# ---- distance_weighted_kl ----
+# Distance-weighted KL:
 DISTANCE_WEIGHT_SCHEDULE=${DISTANCE_WEIGHT_SCHEDULE:-off}
 DISTANCE_WEIGHT_LATE_MULT=${DISTANCE_WEIGHT_LATE_MULT:-2.0}
 DISTANCE_WEIGHT_ALPHA=${DISTANCE_WEIGHT_ALPHA:-2.0}
 
-# ---- teacher_ctx_reinjection ----
+# Teacher context reinjection:
 REINJECTION_ENABLED=${REINJECTION_ENABLED:-false}
-REINJECTION_MODE=${REINJECTION_MODE:-multi_pass}   # multi_pass (default) | cumulative
+REINJECTION_MODE=${REINJECTION_MODE:-multi_pass}
+# REINJECTION_MODE options:
+#   multi_pass — inject new content on each pass (replacement semantics)
+#   cumulative — inject content accumulated over passes
 REINJECTION_INTERVAL=${REINJECTION_INTERVAL:-2048}
 REINJECTION_CONTENT=${REINJECTION_CONTENT:-specific_context}
+# REINJECTION_CONTENT options:
+#   specific_context        — re-assert the ctx text originally prepended before reasoning
+#   conciseness_instruction — hardcoded generic "be concise" nudge, no problem-specific content
 
 MODEL_PATH=${MODEL_PATH:?MODEL_PATH environment variable is required} \
 SD_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts.parquet \
