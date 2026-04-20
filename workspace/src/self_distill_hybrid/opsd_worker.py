@@ -1,13 +1,15 @@
 """
 OPSD (On-Policy Self-Distillation) worker.
 
-Extends SelfDistillWorker with a JSD-based training step (``update_opsd``).
-The teacher model is the frozen ``ref_module_fsdp`` (initial policy weights)
-and the student model is the trainable ``actor_module_fsdp``.
+Extends SelfDistillWorker with a divergence-based training step
+(``update_opsd``). The teacher model is the frozen ``ref_module_fsdp``
+(initial policy weights) and the student model is the trainable
+``actor_module_fsdp``.
 
 Key difference from ``update_sft``:
   - Two forward passes per micro-batch (teacher no-grad + student with-grad)
-  - Loss is JSD divergence between teacher and student logit distributions
+  - Loss is one of JSD / reverse KL / correctness-branched KL between teacher
+    and student logit distributions (selected via ``opsd.loss_type``)
   - Trains on ALL rollouts, not just correct ones
 """
 
@@ -180,14 +182,15 @@ class OPSDWorker(SelfDistillWorker):
           1. Forward teacher (frozen ref model) on teacher_input_ids -> teacher logits
           2. Forward student (trainable actor) on student_input_ids -> student logits
           3. Extract response logits using respective loss_masks
-          4. Compute divergence loss (JSD or reverse KL)
+          4. Compute divergence loss (JSD / reverse KL / correctness-branched KL)
           5. Backward with gradient accumulation scaling
 
         Args:
             data: DataProto with teacher_* and student_* tensors.
             beta: JSD interpolation parameter (0.5 = symmetric JSD).
-                  Unused for reverse_kl but passed through for API consistency.
-            loss_type: "jsd" or "reverse_kl".
+                  Unused for reverse_kl / branched KL but passed through for
+                  API consistency.
+            loss_type: "jsd", "reverse_kl", or "correctness_branched_kl".
 
         Returns:
             Dictionary of training metrics.
@@ -238,6 +241,9 @@ class OPSDWorker(SelfDistillWorker):
 
         # Distance-weighting token weights (padded) — optional input batch field.
         has_token_weights = "kl_token_weights_padded" in data.batch.keys()
+        # Per-token reverse-KL mask (padded) for correctness-branched KL. When
+        # present, True tokens use reverse KL and False tokens use forward KL.
+        has_use_reverse_kl_mask = "use_reverse_kl_mask_padded" in data.batch.keys()
 
         for mb_idx, micro_batch in enumerate(micro_batches):
             micro_batch = micro_batch.to(device)
@@ -308,10 +314,18 @@ class OPSDWorker(SelfDistillWorker):
             loss_fn_map = {
                 "jsd": (self._compute_jsd_loss, self._compute_jsd_loss_liger),
                 "reverse_kl": (self._compute_reverse_kl_loss, self._compute_reverse_kl_loss_liger),
+                "correctness_branched_kl": (
+                    self._compute_correctness_branched_kl_loss,
+                    self._compute_correctness_branched_kl_loss_liger,
+                ),
             }
             if loss_type not in loss_fn_map:
-                raise ValueError(f"Unknown loss_type: {loss_type!r}. Expected one of {list(loss_fn_map)}")
+                raise ValueError(
+                    f"Unknown loss_type: {loss_type!r}. "
+                    f"Expected one of {list(loss_fn_map)}"
+                )
             fn_standard, fn_liger = loss_fn_map[loss_type]
+            fn = fn_liger if use_liger else fn_standard
 
             # Optional per-token KL weights (for distance_weighted_kl). Provided by
             # the trainer as a (mb_B, max_L) padded tensor aligned with student
@@ -326,14 +340,26 @@ class OPSDWorker(SelfDistillWorker):
                 # Safety: trim to min_len in case of any length divergence.
                 mb_token_weights = mb_token_weights[:min_len]
 
+            # Per-token reverse-KL mask for correctness-branched KL only.
+            mb_use_reverse_kl = None
+            if loss_type == "correctness_branched_kl":
+                if not has_use_reverse_kl_mask:
+                    raise ValueError(
+                        "loss_type='correctness_branched_kl' requires "
+                        "'use_reverse_kl_mask_padded' in the batch, which the "
+                        "trainer should have populated via "
+                        "_build_use_reverse_kl_mask_padded."
+                    )
+                m_padded = micro_batch.batch["use_reverse_kl_mask_padded"]  # (mb_B, max_L) bool
+                mb_use_reverse_kl = self._extract_response_values(
+                    m_padded, s_loss_mask
+                ).to(s_logits_aligned.device).bool()
+                mb_use_reverse_kl = mb_use_reverse_kl[:min_len]
+
             # Return the unreduced per-token KL when kl_probe collection is on.
             want_per_token = collect_per_token_kl
 
             if loss_type == "reverse_kl":
-                fn = (
-                    self._compute_reverse_kl_loss_liger if use_liger
-                    else self._compute_reverse_kl_loss
-                )
                 result = fn(
                     t_logits_aligned,
                     s_logits_aligned,
@@ -341,8 +367,16 @@ class OPSDWorker(SelfDistillWorker):
                     token_weights=mb_token_weights,
                     return_per_token=want_per_token,
                 )
-            else:
-                fn = fn_liger if use_liger else fn_standard
+            elif loss_type == "correctness_branched_kl":
+                result = fn(
+                    t_logits_aligned,
+                    s_logits_aligned,
+                    use_reverse_kl_mask=mb_use_reverse_kl,
+                    beta=beta,
+                    token_weights=mb_token_weights,
+                    return_per_token=False,  # probe disabled for branched in v1
+                )
+            else:  # jsd
                 result = fn(t_logits_aligned, s_logits_aligned, beta=beta)
 
             if isinstance(result, tuple) and len(result) == 3:
@@ -898,6 +932,164 @@ class OPSDWorker(SelfDistillWorker):
             # KL(p_S || p_T) = sum p_S * (log p_S - log p_T)
             kl_chunk = F.kl_div(t_lp, s_lp, reduction="none", log_target=True).sum(dim=-1)
             del t_lp, s_lp
+
+            if return_per_token:
+                per_token_parts.append(kl_chunk.detach())
+
+            if token_weights is not None:
+                kl_chunk = kl_chunk * token_weights[start:end]
+
+            kl_sum = kl_sum + kl_chunk.sum()
+            del kl_chunk
+
+        loss = kl_sum / n_tokens
+        if return_per_token:
+            per_token_kl = torch.cat(per_token_parts, dim=0)
+            return loss, n_tokens, per_token_kl
+        return loss, n_tokens
+
+    @staticmethod
+    def _compute_correctness_branched_kl_loss(
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        use_reverse_kl_mask: torch.Tensor,
+        beta: float = 0.5,
+        chunk_size: int = 512,
+        token_weights: Optional[torch.Tensor] = None,
+        return_per_token: bool = False,
+    ):
+        """Correctness-branched KL: reverse KL on some tokens, forward KL on others.
+
+        Routes each response token independently based on ``use_reverse_kl_mask``:
+          - True  -> KL(student || teacher) = sum p_S * (log p_S - log p_T)
+                    (mode-seeking; preserves the kl-to-correct behavior)
+          - False -> KL(teacher || student) = sum p_T * (log p_T - log p_S)
+                    (mass-covering; stronger corrective signal on the first
+                    differing token for incorrect rollouts)
+
+        The ``use_reverse_kl_mask`` is produced by the trainer (see
+        ``OPSDTrainer._build_use_reverse_kl_mask_padded``) from a per-sample
+        correct/truncated decision; the sample-level choice is then broadcast
+        to every response token of that row so the loss can be computed in a
+        single chunked pass.
+
+        Args:
+            teacher_logits: (N, V) — logits from frozen teacher (no grad).
+            student_logits: (N, V) — logits from trainable student (with grad).
+            use_reverse_kl_mask: (N,) bool. True = reverse KL, False = forward KL.
+            beta: Unused, kept for API compatibility with JSD/reverse_kl.
+            chunk_size: Number of tokens to process at a time.
+            token_weights: Optional (N,) float tensor multiplied onto per-token
+                KL before reduction (used by distance_weighted_kl).
+            return_per_token: If True, additionally return the (N,) per-token KL.
+
+        Returns:
+            (loss, n_tokens) or (loss, n_tokens, per_token_kl).
+        """
+        n_tokens = teacher_logits.shape[0]
+        if n_tokens == 0:
+            zero = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+            if return_per_token:
+                return zero, 0, torch.zeros(0, device=student_logits.device)
+            return zero, 0
+
+        if use_reverse_kl_mask.shape != (n_tokens,):
+            raise ValueError(
+                f"use_reverse_kl_mask shape {tuple(use_reverse_kl_mask.shape)} "
+                f"!= ({n_tokens},)"
+            )
+
+        kl_sum = torch.tensor(0.0, device=student_logits.device)
+        per_token_parts = [] if return_per_token else None
+
+        for start in range(0, n_tokens, chunk_size):
+            end = min(start + chunk_size, n_tokens)
+
+            t_log_probs = F.log_softmax(teacher_logits[start:end].float(), dim=-1)
+            s_log_probs = F.log_softmax(student_logits[start:end].float(), dim=-1)
+
+            s_probs = s_log_probs.exp()
+            rev_kl = (s_probs * (s_log_probs - t_log_probs)).sum(dim=-1)
+            del s_probs
+
+            t_probs = t_log_probs.exp()
+            fwd_kl = (t_probs * (t_log_probs - s_log_probs)).sum(dim=-1)
+            del t_probs
+
+            mask_chunk = use_reverse_kl_mask[start:end]
+            kl_chunk = torch.where(mask_chunk, rev_kl, fwd_kl)
+            del t_log_probs, s_log_probs, rev_kl, fwd_kl
+
+            if return_per_token:
+                per_token_parts.append(kl_chunk.detach())
+
+            if token_weights is not None:
+                kl_chunk = kl_chunk * token_weights[start:end]
+
+            kl_sum = kl_sum + kl_chunk.sum()
+            del kl_chunk
+
+        loss = kl_sum / n_tokens
+        if return_per_token:
+            per_token_kl = torch.cat(per_token_parts, dim=0)
+            return loss, n_tokens, per_token_kl
+        return loss, n_tokens
+
+    @staticmethod
+    def _compute_correctness_branched_kl_loss_liger(
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        use_reverse_kl_mask: torch.Tensor,
+        beta: float = 0.5,
+        chunk_size: int = 256,
+        token_weights: Optional[torch.Tensor] = None,
+        return_per_token: bool = False,
+    ):
+        """Memory-efficient correctness-branched KL.
+
+        Same semantics as ``_compute_correctness_branched_kl_loss`` but with
+        progressive teacher freeing (clone teacher chunks, delete original) for
+        lower peak memory.
+        """
+        n_tokens = teacher_logits.shape[0]
+        if n_tokens == 0:
+            zero = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+            if return_per_token:
+                return zero, 0, torch.zeros(0, device=student_logits.device)
+            return zero, 0
+
+        if use_reverse_kl_mask.shape != (n_tokens,):
+            raise ValueError(
+                f"use_reverse_kl_mask shape {tuple(use_reverse_kl_mask.shape)} "
+                f"!= ({n_tokens},)"
+            )
+
+        teacher_chunks = [c.clone() for c in teacher_logits.split(chunk_size, dim=0)]
+        del teacher_logits
+
+        kl_sum = torch.tensor(0.0, device=student_logits.device)
+        per_token_parts = [] if return_per_token else None
+
+        for i, t_chunk in enumerate(teacher_chunks):
+            start = i * chunk_size
+            end = start + t_chunk.shape[0]
+
+            t_lp = F.log_softmax(t_chunk.float(), dim=-1)
+            s_lp = F.log_softmax(student_logits[start:end].float(), dim=-1)
+            del t_chunk
+            teacher_chunks[i] = None
+
+            s_p = s_lp.exp()
+            rev_kl = (s_p * (s_lp - t_lp)).sum(dim=-1)
+            del s_p
+
+            t_p = t_lp.exp()
+            fwd_kl = (t_p * (t_lp - s_lp)).sum(dim=-1)
+            del t_p
+
+            mask_chunk = use_reverse_kl_mask[start:end]
+            kl_chunk = torch.where(mask_chunk, rev_kl, fwd_kl)
+            del t_lp, s_lp, rev_kl, fwd_kl
 
             if return_per_token:
                 per_token_parts.append(kl_chunk.detach())

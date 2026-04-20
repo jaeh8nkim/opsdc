@@ -103,9 +103,20 @@ opsd:
   # beta * KL(p_teacher || m) + (1-beta) * KL(p_student || m)
   beta: 0.5
 
-  # Loss type: "jsd" (Jensen-Shannon divergence) or "reverse_kl" (KL(student || teacher))
-  # reverse_kl is mode-seeking — student concentrates on teacher's high-probability tokens
+  # Loss type: one of
+  #   "jsd"                     — Jensen-Shannon divergence (symmetric)
+  #   "reverse_kl"              — KL(student || teacher); mode-seeking, baseline
+  #   "correctness_branched_kl" — reverse KL for correct rollouts, forward KL for
+  #                               incorrect rollouts. Requires truncated_handling
+  #                               and kl_gating="all".
   loss_type: reverse_kl
+
+  # How to route (correct=False, truncated=True) samples in correctness_branched_kl.
+  # Required when loss_type=correctness_branched_kl; ignored otherwise.
+  #   "as_correct"    — incorrect-AND-truncated -> reverse KL (bundled with correct)
+  #   "as_incorrect"  — incorrect-AND-truncated -> forward KL (strict reading of incorrect)
+  # correct samples always receive reverse KL regardless of this setting.
+  truncated_handling: null
 
   # Maximum sequence length for OPSD training (prompt + response)
   sft_max_length: 32768

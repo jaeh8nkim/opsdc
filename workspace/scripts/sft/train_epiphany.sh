@@ -25,6 +25,7 @@
 # Usage:
 #   MODEL_PATH=Qwen/Qwen3-8B ./workspace/scripts/sft/train_epiphany.sh
 #   KL_GATING=correct_only REINJECTION_ENABLED=true REINJECTION_MODE=cumulative MODEL_PATH=Qwen/Qwen3-8B ./workspace/scripts/sft/train_epiphany.sh
+#   OPSD_LOSS_TYPE=correctness_branched_kl TRUNCATED_HANDLING=as_incorrect KL_GATING=all MODEL_PATH=Qwen/Qwen3-8B ./workspace/scripts/sft/train_epiphany.sh
 
 SD_MAX_TOKENS=8192
 TURN2_MAX_TOKENS=8192
@@ -44,6 +45,18 @@ KL_GATING=${KL_GATING:-all}
 #   correct_only           — KL only on correct rollouts
 #   correct_and_truncated  — KL on correct + truncated rollouts
 #   incorrect_only         — KL only on incorrect rollouts
+
+OPSD_LOSS_TYPE=${OPSD_LOSS_TYPE:-reverse_kl}
+# OPSD_LOSS_TYPE options:
+#   jsd                        — Jensen-Shannon divergence (symmetric)
+#   reverse_kl                 — KL(student || teacher); mode-seeking, baseline
+#   correctness_branched_kl    — reverse KL for correct rollouts, forward KL for incorrect. Requires TRUNCATED_HANDLING and KL_GATING=all.
+
+TRUNCATED_HANDLING=${TRUNCATED_HANDLING:-null}
+# TRUNCATED_HANDLING options (required when OPSD_LOSS_TYPE=correctness_branched_kl):
+#   as_correct    — (correct=F, truncated=T) -> reverse KL (bundled with correct)
+#   as_incorrect  — (correct=F, truncated=T) -> forward KL (strict incorrect reading)
+
 EXPERT_DEMO_PATH=${EXPERT_DEMO_PATH:-./workspace/data/expert_demonstrations/expert_demos_3200.parquet}
 
 # KL-by-position probe:
@@ -72,7 +85,8 @@ MODEL_PATH=${MODEL_PATH:?MODEL_PATH environment variable is required} \
 SD_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts.parquet \
 SD_VAL_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts_val.parquet \
 OPSD_BETA=0.5 \
-OPSD_LOSS_TYPE=reverse_kl \
+OPSD_LOSS_TYPE=$OPSD_LOSS_TYPE \
+TRUNCATED_HANDLING=$TRUNCATED_HANDLING \
 SD_TEMPERATURE=1.0 \
 SD_TOP_P=1.0 \
 SD_MAX_TOKENS=$SD_MAX_TOKENS \
@@ -113,4 +127,5 @@ bash workspace/scripts/sft/train_opsd.sh \
     opsd.teacher_ctx_reinjection.enabled=$REINJECTION_ENABLED \
     opsd.teacher_ctx_reinjection.mode=$REINJECTION_MODE \
     opsd.teacher_ctx_reinjection.interval=$REINJECTION_INTERVAL \
-    opsd.teacher_ctx_reinjection.content=$REINJECTION_CONTENT
+    opsd.teacher_ctx_reinjection.content=$REINJECTION_CONTENT \
+    "$@"

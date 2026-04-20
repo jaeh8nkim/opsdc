@@ -88,8 +88,12 @@ PROMPT_TEMPLATE=${PROMPT_TEMPLATE:-}
 # JSD interpolation: beta=0.5 gives symmetric JSD
 OPSD_BETA=${OPSD_BETA:-0.5}
 
-# Loss type: "jsd" or "reverse_kl"
+# Loss type: "jsd", "reverse_kl", or "correctness_branched_kl"
 OPSD_LOSS_TYPE=${OPSD_LOSS_TYPE:-reverse_kl}
+
+# Required when OPSD_LOSS_TYPE=correctness_branched_kl: "as_correct" | "as_incorrect".
+# Ignored for other loss types. Passed through as hydra null when unset.
+TRUNCATED_HANDLING=${TRUNCATED_HANDLING:-null}
 
 # Memory-efficient JSD via logsumexp + progressive teacher freeing
 USE_LIGER=${USE_LIGER:-false}
@@ -162,6 +166,7 @@ echo "  Model:           ${MODEL_PATH}"
 echo "  SD Prompts:      ${SD_PROMPTS_PATH}"
 echo "  OPSD Beta:       ${OPSD_BETA}"
 echo "  Loss type:       ${OPSD_LOSS_TYPE}"
+echo "  Trunc handling:  ${TRUNCATED_HANDLING}"
 echo "  Temperature:     ${SD_TEMPERATURE}"
 echo "  Top-p:           ${SD_TOP_P}"
 echo "  Epochs:          ${TOTAL_EPOCHS}"
@@ -269,6 +274,7 @@ python3 -m self_distill_hybrid.main_opsd \
     \
     opsd.beta="${OPSD_BETA}" \
     opsd.loss_type="${OPSD_LOSS_TYPE}" \
+    opsd.truncated_handling="${TRUNCATED_HANDLING}" \
     opsd.sft_max_length="${SFT_MAX_LENGTH}" \
     opsd.check_structure="${CHECK_STRUCTURE}" \
     opsd.sd_max_tokens="${SD_MAX_TOKENS}" \

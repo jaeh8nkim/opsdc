@@ -46,6 +46,10 @@ from .kl_probe import (
     find_think_close,
     snap_to_boundary,
 )
+from .opsd_config_validation import (
+    compute_use_reverse_kl_sample,
+    validate_opsd_config,
+)
 from .sd_verifier import (
     build_opsd_batch,
     build_opsd_batch_multipass,
@@ -118,17 +122,18 @@ class OPSDTrainer:
         # OPSD-specific config
         self.opsd_config = self.config.get("opsd", {})
         self.beta = self.opsd_config.get("beta", 0.5)
-        self.loss_type = self.opsd_config.get("loss_type", "jsd")  # "jsd" or "reverse_kl"
+        # Validate loss_type / kl_gating / truncated_handling via shared utility.
+        # Raises on invalid; also enforces branched KL's (kl_gating='all' + required
+        # truncated_handling) requirement.
+        self.loss_type, self.kl_gating, self.truncated_handling = (
+            validate_opsd_config(self.opsd_config)
+        )
         self.sft_max_length = self.opsd_config.get("sft_max_length", 32768)
         self.check_structure = self.opsd_config.get("check_structure", True)
         self.log_sample_count = self.opsd_config.get("log_sample_count", 5)
         self.test_freq = self.opsd_config.get("test_freq", 10)
         self.log_freq = self.opsd_config.get("log_freq", 5)
         self.teacher_update_freq = self.opsd_config.get("teacher_update_freq", 0) or 0
-        self.kl_gating = self.opsd_config.get("kl_gating", "all")
-        assert self.kl_gating in (
-            "all", "correct_only", "correct_and_truncated", "incorrect_only",
-        ), f"Invalid kl_gating mode: {self.kl_gating}"
         self.teacher_ctx_mode = self.opsd_config.get("teacher_ctx_mode", "sd_prompt")
         assert self.teacher_ctx_mode in TEACHER_CTX_MODES, (
             f"Invalid teacher_ctx_mode: {self.teacher_ctx_mode} "
@@ -839,6 +844,9 @@ class OPSDTrainer:
                 n_kl_samples = sum(kl_mask)
                 metrics["sd/n_kl_samples"] = n_kl_samples
 
+                if self.loss_type == "correctness_branched_kl":
+                    metrics["sd/truncated_handling"] = self.truncated_handling
+
                 teacher_solutions = list(batch.non_tensor_batch.get("teacher_solution", []))
                 if teacher_solutions:
                     teacher_lens = [len(t) for t in teacher_solutions]
@@ -907,12 +915,21 @@ class OPSDTrainer:
                         "Step %d: No KL-active samples — skipping OPSD update",
                         self.global_steps,
                     )
-                    opsd_metrics = {"opsd/loss": 0.0, "opsd/skipped": 1.0, "opsd/n_samples": 0}
+                    opsd_metrics = {
+                        "opsd/loss": 0.0, "opsd/skipped": 1.0, "opsd/n_samples": 0,
+                        "opsd/n_kept_active_samples": 0,
+                        "opsd/n_dropped_active_samples": 0,
+                    }
+                    if self.loss_type == "correctness_branched_kl":
+                        opsd_metrics["opsd/n_reverse_kl_active_samples"] = 0
+                        opsd_metrics["opsd/n_forward_kl_active_samples"] = 0
                     metrics.update(opsd_metrics)
                 else:
                     train_t0 = time.time()
                     opsd_metrics = self._opsd_update(
                         batch, responses, epiphanies=epiphanies, kl_mask=kl_mask,
+                        correct_mask=list(correct_mask),
+                        truncated_mask=truncated_mask,
                     )
                     train_time = time.time() - train_t0
                     metrics.update(opsd_metrics)
@@ -1563,6 +1580,31 @@ class OPSDTrainer:
         # "off"
         return torch.ones_like(relpos)
 
+    @staticmethod
+    def _build_use_reverse_kl_mask_padded(
+        student_loss_mask: torch.Tensor,
+        row_use_reverse_kl: list[bool],
+    ) -> torch.Tensor:
+        """Build the (B, max_L) padded per-token reverse-KL mask.
+
+        True at response-token positions of rows that should use reverse KL
+        (correct side per ``compute_use_reverse_kl_sample``). False everywhere
+        else — non-response positions AND response positions of forward-KL rows.
+        Worker flattens this to (N,) via ``_extract_response_values``.
+        """
+        B, max_L = student_loss_mask.shape
+        if len(row_use_reverse_kl) != B:
+            raise ValueError(
+                f"row_use_reverse_kl length {len(row_use_reverse_kl)} != "
+                f"batch dim {B}"
+            )
+        out = torch.zeros(B, max_L, dtype=torch.bool)
+        bool_mask = student_loss_mask.bool()
+        for i, use_rev in enumerate(row_use_reverse_kl):
+            if use_rev:
+                out[i] = bool_mask[i]
+        return out
+
     def _build_kl_token_weights_padded(
         self,
         student_loss_mask: torch.Tensor,
@@ -1710,6 +1752,8 @@ class OPSDTrainer:
         responses: list[str],
         epiphanies: list[str] = None,
         kl_mask: list[bool] | None = None,
+        correct_mask: list[bool] | None = None,
+        truncated_mask: list[bool] | None = None,
     ) -> dict:
         """Build OPSD batch and dispatch JSD training to workers.
 
@@ -1724,15 +1768,29 @@ class OPSDTrainer:
             epiphanies: Optional list of stripped Turn 2 memos (only populated
                 when teacher_ctx_mode == "reflection_from_gt").
             kl_mask: Per-sample mask — True = include in training, False = skip.
+            correct_mask: Per-sample correctness flag (required for
+                ``correctness_branched_kl``; otherwise may be ``None``).
+            truncated_mask: Per-sample truncation flag (required for
+                ``correctness_branched_kl``; otherwise may be ``None``).
 
         Returns:
             Dictionary of training metrics.
         """
+        if self.loss_type == "correctness_branched_kl":
+            assert kl_mask is not None, (
+                "correctness_branched_kl requires kl_mask (even if all-True) "
+                "to align with the active-sample filter path"
+            )
+            assert correct_mask is not None and truncated_mask is not None, (
+                "correctness_branched_kl requires correct_mask and truncated_mask"
+            )
+
         student_prompts = list(original_batch.non_tensor_batch["sft_prompt"])
         sd_prompts = list(original_batch.non_tensor_batch["sd_prompt"])
         ground_truths = list(original_batch.non_tensor_batch["ground_truth"])
 
         # Filter to KL-active samples only
+        active: list[int] = list(range(len(responses)))
         if kl_mask is not None:
             active = [i for i, m in enumerate(kl_mask) if m]
             student_prompts = [student_prompts[i] for i in active]
@@ -1741,6 +1799,44 @@ class OPSDTrainer:
             responses = [responses[i] for i in active]
             if epiphanies is not None:
                 epiphanies = [epiphanies[i] for i in active]
+
+        # Branched KL: compute per-sample direction (reverse vs forward) once,
+        # over the active subset. Reused for (i) row broadcast, (ii) metrics,
+        # (iii) early-return metric shape.
+        use_reverse_kl_sample: list[bool] | None = None
+        n_reverse_active = 0
+        n_forward_active = 0
+        if self.loss_type == "correctness_branched_kl":
+            active_correct = [correct_mask[i] for i in active]
+            active_truncated = [truncated_mask[i] for i in active]
+            use_reverse_kl_sample = compute_use_reverse_kl_sample(
+                active_correct, active_truncated, self.truncated_handling,
+            )
+            n_reverse_active = sum(use_reverse_kl_sample)
+            n_forward_active = len(use_reverse_kl_sample) - n_reverse_active
+
+        def _branched_direction_metrics() -> dict:
+            """Direction counts + truncated_handling echo for branched mode.
+
+            Called in every return path so invariant
+            ``n_reverse_active + n_forward_active == len(active)`` holds
+            regardless of early-return / normal completion.
+            """
+            if self.loss_type != "correctness_branched_kl":
+                return {}
+            return {
+                "opsd/n_reverse_kl_active_samples": n_reverse_active,
+                "opsd/n_forward_kl_active_samples": n_forward_active,
+            }
+
+        def _kept_metrics(n_kept: int) -> dict:
+            """kept/dropped counts in active-sample units. Populated for all
+            loss types so dashboards/tests see a stable schema when branched
+            KL is on (and harmless when off)."""
+            return {
+                "opsd/n_kept_active_samples": n_kept,
+                "opsd/n_dropped_active_samples": max(0, len(active) - n_kept),
+            }
 
         builders = {
             "sd_prompt": lambda: sd_prompts,
@@ -1773,6 +1869,8 @@ class OPSDTrainer:
             and self.reinjection_mode == "multi_pass"
         )
 
+        row_use_reverse_kl: list[bool] | None = None
+
         if multipass:
             built = build_opsd_batch_multipass(
                 teacher_prompts=teacher_prompts,
@@ -1784,7 +1882,11 @@ class OPSDTrainer:
                 reinject_positions=teacher_reinject_positions_sorted,
             )
             if built is None:
-                return {"opsd/loss": 0.0, "opsd/skipped": 1.0}
+                return {
+                    "opsd/loss": 0.0, "opsd/skipped": 1.0, "opsd/n_samples": 0,
+                    **_kept_metrics(0),
+                    **_branched_direction_metrics(),
+                }
             opsd_batch, row_sample_idx, row_segment_idx = built
             n_rows = opsd_batch.batch["student_input_ids"].shape[0]
             # In multi-pass the "shard_batch_idx" identifies the ORIGINAL sample
@@ -1797,6 +1899,14 @@ class OPSDTrainer:
                 opsd_batch.batch["segment_idx"] = torch.tensor(
                     row_segment_idx, dtype=torch.long
                 )
+            if use_reverse_kl_sample is not None:
+                # Multi-pass expands one active sample into K+1 rows; replicate
+                # the per-sample direction decision to each of those rows using
+                # the sample index returned by the builder.
+                row_use_reverse_kl = [
+                    use_reverse_kl_sample[s] for s in row_sample_idx
+                ]
+            n_kept_active = len(set(row_sample_idx))
         else:
             opsd_batch = build_opsd_batch(
                 teacher_prompts=teacher_prompts,
@@ -1808,13 +1918,30 @@ class OPSDTrainer:
                 teacher_reinject_positions=teacher_reinject_positions_set,
             )
             if opsd_batch is None:
-                return {"opsd/loss": 0.0, "opsd/skipped": 1.0}
+                return {
+                    "opsd/loss": 0.0, "opsd/skipped": 1.0, "opsd/n_samples": 0,
+                    **_kept_metrics(0),
+                    **_branched_direction_metrics(),
+                }
             n_rows = opsd_batch.batch["student_input_ids"].shape[0]
             if self.kl_probe_cfg.enabled:
                 opsd_batch.batch["shard_batch_idx"] = torch.arange(
                     n_rows, dtype=torch.long
                 )
                 opsd_batch.batch["segment_idx"] = torch.zeros(n_rows, dtype=torch.long)
+            if use_reverse_kl_sample is not None:
+                # Cumulative path is 1:1 between active samples and rows unless
+                # ``build_opsd_batch`` silently drops tokenization failures
+                # (rare in practice; pre-existing issue affecting kl_probe too).
+                # Fail loudly if that drop ever happens under branched KL so a
+                # silent misalignment does not sneak into the loss.
+                assert n_rows == len(use_reverse_kl_sample), (
+                    f"build_opsd_batch dropped {len(use_reverse_kl_sample) - n_rows} "
+                    "sample(s); correctness_branched_kl relies on 1:1 row-to-active "
+                    "mapping in the cumulative path."
+                )
+                row_use_reverse_kl = list(use_reverse_kl_sample)
+            n_kept_active = n_rows
 
         n_samples = n_rows  # legacy name; now may be row count in multi-pass
 
@@ -1828,6 +1955,18 @@ class OPSDTrainer:
         )
         if kl_weights_padded is not None:
             opsd_batch.batch["kl_token_weights_padded"] = kl_weights_padded
+
+        # ---- Branched KL: per-token reverse-KL mask ----
+        # Mirrors ``kl_token_weights_padded``: (B, max_L) bool with True at
+        # response positions of rows that should use reverse KL (correct side)
+        # and False elsewhere (non-response OR forward-KL rows). Worker flattens
+        # this to (N,) via ``_extract_response_values`` and hands it to the
+        # branched loss function.
+        if row_use_reverse_kl is not None:
+            use_reverse_kl_padded = self._build_use_reverse_kl_mask_padded(
+                opsd_batch.batch["student_loss_mask"], row_use_reverse_kl,
+            )
+            opsd_batch.batch["use_reverse_kl_mask_padded"] = use_reverse_kl_padded
 
         # DP-pad: ensure batch is divisible by number of DP workers
         n_dp = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
@@ -1885,6 +2024,8 @@ class OPSDTrainer:
             self.reinjection_mode if self.reinjection_enabled else "off"
         )
         opsd_metrics["opsd/distance_weighting"] = self.distance_weight_schedule
+        opsd_metrics.update(_kept_metrics(n_kept_active))
+        opsd_metrics.update(_branched_direction_metrics())
         return opsd_metrics
 
     # ------------------------------------------------------------------
