@@ -751,15 +751,17 @@ class OPSDWorker(SelfDistillWorker):
         beta: float = 0.5,
         chunk_size: int = 256,
     ) -> tuple[torch.Tensor, int]:
-        """Memory-efficient JSD using logsumexp for the mixture distribution.
+        """Memory-efficient JSD using a KL-style chunked loop.
 
         Improvements over ``_compute_jsd_loss``:
-          1. **logsumexp mixture**: Computes log(beta*p_T + (1-beta)*p_S) via
-             logsumexp in log-space, avoiding explicit probability tensors.
-             This reduces peak float32 intermediates from ~6 (C,V) to ~4 (C,V).
-          2. **Progressive teacher freeing**: Clones teacher logits into chunks
-             and frees the original, so only one teacher chunk is alive at a time.
-          3. **Smaller default chunk_size** (256 vs 512) for lower per-chunk peak.
+          1. **Log-space mixture**: Computes ``log(beta*p_T + (1-beta)*p_S)``
+             directly in log-space, avoiding explicit probability tensors.
+          2. **KL-style chunking**: Iterates over slices of ``teacher_logits``
+             directly, matching the reverse-KL helpers instead of cloning every
+             chunk up front.
+          3. **No stacked mixture tensor**: Avoids materializing a temporary
+             ``(2, chunk_size, vocab)`` buffer via ``torch.stack`` before
+             ``logsumexp``, which lowers peak memory.
 
         Args:
             teacher_logits: (N, V) — logits from frozen teacher (no grad).
@@ -774,33 +776,37 @@ class OPSDWorker(SelfDistillWorker):
         if n_tokens == 0:
             return torch.tensor(0.0, device=student_logits.device, requires_grad=True), 0
 
-        # Pre-compute log(beta) and log(1-beta) for logsumexp mixture
+        # Pre-compute log(beta) and log(1-beta) for the log-space mixture.
         log_beta = math.log(beta) if beta > 0 else float("-inf")
         log_1m_beta = math.log(1.0 - beta) if beta < 1 else float("-inf")
-
-        # Clone teacher chunks and free the original contiguous tensor.
-        # Teacher has no grad, so cloning is cheap and frees ~N*V*2 bytes.
-        teacher_chunks = [c.clone() for c in teacher_logits.split(chunk_size, dim=0)]
-        del teacher_logits
+        log_half = -math.log(2.0)
 
         jsd_sum = torch.tensor(0.0, device=student_logits.device)
 
-        for i, t_chunk in enumerate(teacher_chunks):
-            start = i * chunk_size
-            end = start + t_chunk.shape[0]
+        for start in range(0, n_tokens, chunk_size):
+            end = min(start + chunk_size, n_tokens)
 
             # Convert to float32 for numerical stability
-            t_lp = F.log_softmax(t_chunk.float(), dim=-1)
+            t_lp = F.log_softmax(teacher_logits[start:end].float(), dim=-1)
             s_lp = F.log_softmax(student_logits[start:end].float(), dim=-1)
-            del t_chunk
-            teacher_chunks[i] = None  # allow GC
 
-            # logsumexp mixture: log_m = log(beta * exp(t_lp) + (1-beta) * exp(s_lp))
-            #                         = logsumexp([t_lp + log_beta, s_lp + log_1m_beta])
-            log_m = torch.logsumexp(
-                torch.stack([t_lp + log_beta, s_lp + log_1m_beta], dim=0),
-                dim=0,
-            )
+            # Build the log-mixture without allocating a stacked
+            # (2, chunk_size, vocab) temporary.
+            if beta <= 0.0:
+                log_m = s_lp
+            elif beta >= 1.0:
+                log_m = t_lp
+            elif math.isclose(beta, 0.5):
+                log_m = torch.logaddexp(t_lp, s_lp)
+                log_m.add_(log_half)
+            elif beta > 0.5:
+                shift = log_1m_beta - log_beta
+                log_m = torch.logaddexp(t_lp, s_lp + shift)
+                log_m.add_(log_beta)
+            else:
+                shift = log_beta - log_1m_beta
+                log_m = torch.logaddexp(t_lp + shift, s_lp)
+                log_m.add_(log_1m_beta)
 
             # KL(p_T || m) and KL(p_S || m) via F.kl_div with log_target=True
             kl_t = F.kl_div(log_m, t_lp, reduction="none", log_target=True).sum(dim=-1)
