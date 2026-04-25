@@ -6,7 +6,7 @@ module on the standard library only.
 """
 from typing import Optional
 
-VALID_LOSS_TYPES = ("jsd", "reverse_kl", "correctness_branched_kl")
+VALID_LOSS_TYPES = ("jsd", "reverse_kl", "forward_kl", "correctness_branched_kl")
 VALID_GATINGS = ("all", "correct_only", "incorrect_only", "correct_and_truncated")
 VALID_TRUNCATED_HANDLING = ("as_correct", "as_incorrect")
 

@@ -182,15 +182,16 @@ class OPSDWorker(SelfDistillWorker):
           1. Forward teacher (frozen ref model) on teacher_input_ids -> teacher logits
           2. Forward student (trainable actor) on student_input_ids -> student logits
           3. Extract response logits using respective loss_masks
-          4. Compute divergence loss (JSD / reverse KL / correctness-branched KL)
+          4. Compute divergence loss (JSD / reverse KL / forward KL / correctness-branched KL)
           5. Backward with gradient accumulation scaling
 
         Args:
             data: DataProto with teacher_* and student_* tensors.
             beta: JSD interpolation parameter (0.5 = symmetric JSD).
-                  Unused for reverse_kl / branched KL but passed through for
-                  API consistency.
-            loss_type: "jsd", "reverse_kl", or "correctness_branched_kl".
+                  Unused for reverse_kl / forward_kl / branched KL but passed
+                  through for API consistency.
+            loss_type: "jsd", "reverse_kl", "forward_kl", or
+                "correctness_branched_kl".
 
         Returns:
             Dictionary of training metrics.
@@ -226,7 +227,7 @@ class OPSDWorker(SelfDistillWorker):
         # kl_probe collection (per-token KL + per-sample response lengths across
         # the shard). Written to a staging file at end of step when enabled.
         collect_per_token_kl = bool(data.meta_info.get("collect_per_token_kl", False)) \
-            and loss_type == "reverse_kl"
+            and loss_type in ("reverse_kl", "forward_kl")
         per_token_kl_chunks: list[torch.Tensor] = []
         per_sample_lengths_shard: list[int] = []
 
@@ -314,6 +315,7 @@ class OPSDWorker(SelfDistillWorker):
             loss_fn_map = {
                 "jsd": (self._compute_jsd_loss, self._compute_jsd_loss_liger),
                 "reverse_kl": (self._compute_reverse_kl_loss, self._compute_reverse_kl_loss_liger),
+                "forward_kl": (self._compute_forward_kl_loss, self._compute_forward_kl_loss_liger),
                 "correctness_branched_kl": (
                     self._compute_correctness_branched_kl_loss,
                     self._compute_correctness_branched_kl_loss_liger,
@@ -359,7 +361,7 @@ class OPSDWorker(SelfDistillWorker):
             # Return the unreduced per-token KL when kl_probe collection is on.
             want_per_token = collect_per_token_kl
 
-            if loss_type == "reverse_kl":
+            if loss_type in ("reverse_kl", "forward_kl"):
                 result = fn(
                     t_logits_aligned,
                     s_logits_aligned,
@@ -937,6 +939,123 @@ class OPSDWorker(SelfDistillWorker):
 
             # KL(p_S || p_T) = sum p_S * (log p_S - log p_T)
             kl_chunk = F.kl_div(t_lp, s_lp, reduction="none", log_target=True).sum(dim=-1)
+            del t_lp, s_lp
+
+            if return_per_token:
+                per_token_parts.append(kl_chunk.detach())
+
+            if token_weights is not None:
+                kl_chunk = kl_chunk * token_weights[start:end]
+
+            kl_sum = kl_sum + kl_chunk.sum()
+            del kl_chunk
+
+        loss = kl_sum / n_tokens
+        if return_per_token:
+            per_token_kl = torch.cat(per_token_parts, dim=0)
+            return loss, n_tokens, per_token_kl
+        return loss, n_tokens
+
+    # ------------------------------------------------------------------
+    # Forward KL loss: KL(teacher || student)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_forward_kl_loss(
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        beta: float = 0.5,
+        chunk_size: int = 512,
+        token_weights: Optional[torch.Tensor] = None,
+        return_per_token: bool = False,
+    ):
+        """Compute forward KL divergence: KL(teacher || student).
+
+        KL(p_T || p_S) = sum_x p_T(x) * [log p_T(x) - log p_S(x)]
+
+        This is "mode-covering" / mean-seeking: the student is penalised
+        wherever the teacher places probability mass, so it must spread
+        coverage over all teacher modes rather than concentrating on a
+        single one.
+
+        Args / returns mirror :meth:`_compute_reverse_kl_loss` exactly;
+        ``token_weights`` and ``return_per_token`` behave identically.
+        """
+        n_tokens = teacher_logits.shape[0]
+        if n_tokens == 0:
+            zero = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+            if return_per_token:
+                return zero, 0, torch.zeros(0, device=student_logits.device)
+            return zero, 0
+
+        kl_sum = torch.tensor(0.0, device=student_logits.device)
+        per_token_parts = [] if return_per_token else None
+
+        for start in range(0, n_tokens, chunk_size):
+            end = min(start + chunk_size, n_tokens)
+
+            t_log_probs = F.log_softmax(teacher_logits[start:end].float(), dim=-1)
+            s_log_probs = F.log_softmax(student_logits[start:end].float(), dim=-1)
+
+            t_probs = t_log_probs.exp()
+            kl_chunk = (t_probs * (t_log_probs - s_log_probs)).sum(dim=-1)
+            del t_log_probs, s_log_probs, t_probs
+
+            if return_per_token:
+                per_token_parts.append(kl_chunk.detach())
+
+            if token_weights is not None:
+                kl_chunk = kl_chunk * token_weights[start:end]
+
+            kl_sum = kl_sum + kl_chunk.sum()
+            del kl_chunk
+
+        loss = kl_sum / n_tokens
+        if return_per_token:
+            per_token_kl = torch.cat(per_token_parts, dim=0)
+            return loss, n_tokens, per_token_kl
+        return loss, n_tokens
+
+    @staticmethod
+    def _compute_forward_kl_loss_liger(
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        beta: float = 0.5,
+        chunk_size: int = 256,
+        token_weights: Optional[torch.Tensor] = None,
+        return_per_token: bool = False,
+    ):
+        """Memory-efficient forward KL: KL(teacher || student).
+
+        Same as ``_compute_forward_kl_loss`` but with progressive teacher
+        freeing (clone teacher chunks, delete original) for lower peak memory,
+        mirroring :meth:`_compute_reverse_kl_loss_liger`.
+        """
+        n_tokens = teacher_logits.shape[0]
+        if n_tokens == 0:
+            zero = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+            if return_per_token:
+                return zero, 0, torch.zeros(0, device=student_logits.device)
+            return zero, 0
+
+        teacher_chunks = [c.clone() for c in teacher_logits.split(chunk_size, dim=0)]
+        del teacher_logits
+
+        kl_sum = torch.tensor(0.0, device=student_logits.device)
+        per_token_parts = [] if return_per_token else None
+
+        for i, t_chunk in enumerate(teacher_chunks):
+            start = i * chunk_size
+            end = start + t_chunk.shape[0]
+
+            t_lp = F.log_softmax(t_chunk.float(), dim=-1)
+            s_lp = F.log_softmax(student_logits[start:end].float(), dim=-1)
+            del t_chunk
+            teacher_chunks[i] = None
+
+            # F.kl_div(input, target, log_target=True) = exp(target) * (target - input).
+            # With input=s_lp, target=t_lp this is exp(t_lp) * (t_lp - s_lp) = forward KL.
+            kl_chunk = F.kl_div(s_lp, t_lp, reduction="none", log_target=True).sum(dim=-1)
             del t_lp, s_lp
 
             if return_per_token:

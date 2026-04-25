@@ -50,6 +50,7 @@ OPSD_LOSS_TYPE=${OPSD_LOSS_TYPE:-reverse_kl}
 # OPSD_LOSS_TYPE options:
 #   jsd                        — Jensen-Shannon divergence (symmetric)
 #   reverse_kl                 — KL(student || teacher); mode-seeking, baseline
+#   forward_kl                 — KL(teacher || student); mode-covering, mean-seeking
 #   correctness_branched_kl    — reverse KL for correct rollouts, forward KL for incorrect. Requires TRUNCATED_HANDLING and KL_GATING=all.
 
 TRUNCATED_HANDLING=${TRUNCATED_HANDLING:-null}

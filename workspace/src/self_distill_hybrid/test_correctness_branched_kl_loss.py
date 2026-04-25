@@ -340,6 +340,150 @@ class TestTokenWeights:
         )
 
 
+# ---------------------------------------------------------------------------
+# Standalone forward-KL loss (mirrors _compute_forward_kl_loss{,_liger}
+# in opsd_worker.py). Namespace-extracted to avoid VERL imports.
+# ---------------------------------------------------------------------------
+
+
+class _FK:
+    @staticmethod
+    def compute(
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        chunk_size: int = 512,
+        token_weights=None,
+        return_per_token: bool = False,
+    ):
+        n_tokens = teacher_logits.shape[0]
+        if n_tokens == 0:
+            zero = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+            if return_per_token:
+                return zero, 0, torch.zeros(0, device=student_logits.device)
+            return zero, 0
+
+        kl_sum = torch.tensor(0.0, device=student_logits.device)
+        per_token_parts = [] if return_per_token else None
+
+        for start in range(0, n_tokens, chunk_size):
+            end = min(start + chunk_size, n_tokens)
+            t_lp = F.log_softmax(teacher_logits[start:end].float(), dim=-1)
+            s_lp = F.log_softmax(student_logits[start:end].float(), dim=-1)
+            t_p = t_lp.exp()
+            kl_chunk = (t_p * (t_lp - s_lp)).sum(dim=-1)
+            del t_lp, s_lp, t_p
+
+            if return_per_token:
+                per_token_parts.append(kl_chunk.detach())
+            if token_weights is not None:
+                kl_chunk = kl_chunk * token_weights[start:end]
+            kl_sum = kl_sum + kl_chunk.sum()
+            del kl_chunk
+
+        loss = kl_sum / n_tokens
+        if return_per_token:
+            return loss, n_tokens, torch.cat(per_token_parts, dim=0)
+        return loss, n_tokens
+
+    @staticmethod
+    def compute_liger(
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        chunk_size: int = 256,
+        token_weights=None,
+        return_per_token: bool = False,
+    ):
+        n_tokens = teacher_logits.shape[0]
+        if n_tokens == 0:
+            zero = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+            if return_per_token:
+                return zero, 0, torch.zeros(0, device=student_logits.device)
+            return zero, 0
+
+        teacher_chunks = [c.clone() for c in teacher_logits.split(chunk_size, dim=0)]
+        del teacher_logits
+
+        kl_sum = torch.tensor(0.0, device=student_logits.device)
+        per_token_parts = [] if return_per_token else None
+
+        for i, t_chunk in enumerate(teacher_chunks):
+            start = i * chunk_size
+            end = start + t_chunk.shape[0]
+            t_lp = F.log_softmax(t_chunk.float(), dim=-1)
+            s_lp = F.log_softmax(student_logits[start:end].float(), dim=-1)
+            del t_chunk
+            teacher_chunks[i] = None
+
+            kl_chunk = F.kl_div(s_lp, t_lp, reduction="none", log_target=True).sum(dim=-1)
+            del t_lp, s_lp
+
+            if return_per_token:
+                per_token_parts.append(kl_chunk.detach())
+            if token_weights is not None:
+                kl_chunk = kl_chunk * token_weights[start:end]
+            kl_sum = kl_sum + kl_chunk.sum()
+            del kl_chunk
+
+        loss = kl_sum / n_tokens
+        if return_per_token:
+            return loss, n_tokens, torch.cat(per_token_parts, dim=0)
+        return loss, n_tokens
+
+
+class TestForwardKLStandalone:
+    """Parity for the standalone forward-KL loss used by OPSD_LOSS_TYPE=forward_kl."""
+
+    @pytest.mark.parametrize("n_tokens,vocab_size", [
+        (1, 10),
+        (16, 128),
+        (300, 2000),
+    ])
+    def test_forward_kl_matches_reference(self, n_tokens, vocab_size):
+        t = _make_logits(n_tokens, vocab_size, seed=11)
+        s = _make_logits(n_tokens, vocab_size, seed=12)
+        loss_fk, _ = _FK.compute(t, s)
+        loss_ref = _ref_forward_kl(t, s)
+        torch.testing.assert_close(loss_fk, loss_ref, atol=1e-5, rtol=1e-4)
+
+    @pytest.mark.parametrize("n_tokens,vocab_size,chunk", [
+        (1, 10, 512),
+        (16, 128, 4),
+        (300, 2000, 64),
+    ])
+    def test_forward_kl_liger_matches_standard(self, n_tokens, vocab_size, chunk):
+        t = _make_logits(n_tokens, vocab_size, seed=13)
+        s = _make_logits(n_tokens, vocab_size, seed=14)
+        loss_std, _ = _FK.compute(t.clone(), s, chunk_size=chunk)
+        loss_lig, _ = _FK.compute_liger(t.clone(), s, chunk_size=chunk)
+        torch.testing.assert_close(loss_lig, loss_std, atol=1e-5, rtol=1e-4)
+
+    def test_forward_kl_token_weights_mean_preserving(self):
+        n, v = 32, 128
+        t = _make_logits(n, v, seed=15)
+        s = _make_logits(n, v, seed=16)
+
+        # Uniform unit weights reproduce unweighted loss.
+        loss_unweighted, _ = _FK.compute(t.clone(), s.clone())
+        loss_unit, _ = _FK.compute(t.clone(), s.clone(), token_weights=torch.ones(n))
+        torch.testing.assert_close(loss_unit, loss_unweighted, atol=1e-5, rtol=1e-4)
+
+        # Constant scaling factors out cleanly.
+        loss_scaled, _ = _FK.compute(t.clone(), s.clone(), token_weights=torch.full((n,), 2.0))
+        torch.testing.assert_close(
+            loss_scaled, loss_unweighted * 2.0, atol=1e-5, rtol=1e-4,
+        )
+
+        # Non-uniform weights match a hand-computed weighted mean over n tokens
+        # (denominator stays n_tokens, matching the loss's mean-preserving contract).
+        weights = torch.linspace(0.1, 3.0, n)
+        t_lp = F.log_softmax(t.float(), dim=-1)
+        s_lp = F.log_softmax(s.float(), dim=-1)
+        per_tok = (t_lp.exp() * (t_lp - s_lp)).sum(dim=-1)
+        expected = (per_tok * weights).sum() / n
+        loss_weighted, _ = _FK.compute(t.clone(), s.clone(), token_weights=weights)
+        torch.testing.assert_close(loss_weighted, expected, atol=1e-5, rtol=1e-4)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

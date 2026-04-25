@@ -936,7 +936,7 @@ class OPSDTrainer:
                     metrics["timing/train_s"] = train_time
 
                     # ---- KL probe: ingest per-rank staging files and flush on schedule ----
-                    if self.kl_probe_cfg.enabled and self.loss_type == "reverse_kl":
+                    if self.kl_probe_cfg.enabled and self.loss_type in ("reverse_kl", "forward_kl"):
                         # Build active correct/truncated masks in active-sample order,
                         # matching shard_batch_idx assignments made in _opsd_update.
                         if kl_mask is not None:
@@ -2000,7 +2000,7 @@ class OPSDTrainer:
         opsd_batch.meta_info["opsd_beta"] = self.beta
         opsd_batch.meta_info["opsd_loss_type"] = self.loss_type
         # KL probe staging — worker writes its shard's per-token KL to this dir.
-        if self.kl_probe_cfg.enabled and self.loss_type == "reverse_kl":
+        if self.kl_probe_cfg.enabled and self.loss_type in ("reverse_kl", "forward_kl"):
             opsd_batch.meta_info["collect_per_token_kl"] = True
             opsd_batch.meta_info["kl_probe_staging_dir"] = self.kl_probe_staging_dir
             opsd_batch.meta_info["global_steps"] = int(self.global_steps)
