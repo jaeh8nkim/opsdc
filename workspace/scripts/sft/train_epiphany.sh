@@ -109,7 +109,7 @@ VAL_MAX_TOKENS=30000 \
 CHECK_STRUCTURE=false \
 USE_LIGER=true \
 TEACHER_UPDATE_FREQ=9999 \
-VAL_BEFORE_TRAIN=false \
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false} \
 EXPERIMENT_NAME=opsd_epiphany \
 RL_VAL_FILES="['./workspace/data/processed/val_math500.parquet', './workspace/data/processed/val_aime24.parquet', './workspace/data/processed/val_aime25.parquet']" \
 bash workspace/scripts/sft/train_opsd.sh \
