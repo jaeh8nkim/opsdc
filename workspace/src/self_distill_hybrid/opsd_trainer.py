@@ -132,6 +132,7 @@ class OPSDTrainer:
         self.check_structure = self.opsd_config.get("check_structure", True)
         self.log_sample_count = self.opsd_config.get("log_sample_count", 5)
         self.test_freq = self.opsd_config.get("test_freq", 10)
+        self.test_step = self._parse_test_step(self.opsd_config.get("test_step", None))
         self.log_freq = self.opsd_config.get("log_freq", 5)
         self.teacher_update_freq = self.opsd_config.get("teacher_update_freq", 0) or 0
         self.teacher_ctx_mode = self.opsd_config.get("teacher_ctx_mode", "sd_prompt")
@@ -234,6 +235,37 @@ class OPSDTrainer:
     # Initialization helpers (same patterns as SelfDistillTrainer)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _parse_test_step(test_step) -> set[int]:
+        """Normalize optional explicit validation steps to a set of ints."""
+        if test_step is None:
+            return set()
+
+        if isinstance(test_step, str):
+            text = test_step.strip()
+            if text.lower() in {"", "null", "none"}:
+                return set()
+            if text.startswith("[") and text.endswith("]"):
+                text = text[1:-1]
+            values = [item.strip() for item in text.split(",") if item.strip()]
+        else:
+            values = list(test_step)
+
+        steps = {int(step) for step in values}
+        if any(step <= 0 for step in steps):
+            raise ValueError(
+                f"opsd.test_step must contain positive training steps; "
+                f"use trainer.val_before_train for pre-training eval, got {sorted(steps)}"
+            )
+        return steps
+
+    def _is_test_step(self, step: int) -> bool:
+        if step <= 0:
+            return False
+        if self.test_step:
+            return step in self.test_step
+        return self.test_freq > 0 and step % self.test_freq == 0
+
     def _create_dataloader(self, train_dataset: Optional[Dataset], collate_fn):
         if train_dataset is None:
             raise ValueError("train_dataset must be provided for OPSDTrainer")
@@ -334,8 +366,8 @@ class OPSDTrainer:
             self.val_batches.append(DataProto.from_single_dict(chunk_dict))
 
         py_logger.info(
-            "Val data ready: %d samples, %d batch(es), test_freq=%d",
-            n_val, len(self.val_batches), self.test_freq,
+            "Val data ready: %d samples, %d batch(es), test_freq=%d, test_step=%s",
+            n_val, len(self.val_batches), self.test_freq, sorted(self.test_step),
         )
 
     def _build_val_dataloader(self, val_dataset: Optional[Dataset]):
@@ -1003,7 +1035,7 @@ class OPSDTrainer:
 
                 # ---- Phase 4: Validation ----
                 is_last_step = self.global_steps >= self.total_training_steps
-                is_val_step = self.test_freq > 0 and self.global_steps % self.test_freq == 0
+                is_val_step = self._is_test_step(self.global_steps)
                 if self.val_batches and (is_val_step or is_last_step):
                     val_t0 = time.time()
                     val_loss = self._compute_val_loss()

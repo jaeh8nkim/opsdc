@@ -82,6 +82,12 @@ REINJECTION_CONTENT=${REINJECTION_CONTENT:-specific_context}
 #   specific_context        — re-assert the ctx text originally prepended before reasoning
 #   conciseness_instruction — hardcoded generic "be concise" nudge, no problem-specific content
 
+# Optional explicit validation schedule. When unset, TEST_FREQ controls eval.
+# Use VAL_BEFORE_TRAIN for pre-train eval; TEST_STEP must contain positive steps.
+TEST_STEP=${TEST_STEP:-}
+# Example:
+#   TEST_STEP='[5,10,15,20,25,50,75,100,200,300,400,500]' VAL_BEFORE_TRAIN=true OPSD_LOSS_TYPE=correctness_branched_kl TRUNCATED_HANDLING=as_incorrect KL_GATING=all MODEL_PATH=Qwen/Qwen3-8B ./workspace/scripts/sft/train_epiphany.sh trainer.total_epochs=2 trainer.total_training_steps=500 data.train_max_samples=-1 opsd.expert_demo_path=null
+
 MODEL_PATH=${MODEL_PATH:?MODEL_PATH environment variable is required} \
 SD_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts.parquet \
 SD_VAL_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts_val.parquet \
@@ -98,7 +104,8 @@ TRAIN_BATCH_SIZE=32 \
 MICRO_BATCH_SIZE=1 \
 LEARNING_RATE=1e-6 \
 SAVE_FREQ=100 \
-TEST_FREQ=25 \
+TEST_FREQ=${TEST_FREQ:-25} \
+TEST_STEP="${TEST_STEP}" \
 N_GPUS=4 \
 TP_SIZE=2 \
 GPU_MEM_UTIL=0.75 \

@@ -123,6 +123,7 @@ TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-8}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 SAVE_FREQ=${SAVE_FREQ:-9999}
+TEST_STEP=${TEST_STEP:-}
 
 # =============================================================================
 # Infrastructure
@@ -182,6 +183,7 @@ echo "  Use liger:       ${USE_LIGER}"
 echo "  Check struct:    ${CHECK_STRUCTURE}"
 echo "  Teacher update:  every ${TEACHER_UPDATE_FREQ} steps (0=frozen)"
 echo "  Val prompts:     ${SD_VAL_PROMPTS_PATH:-<auto-detect>}"
+echo "  Test steps:      ${TEST_STEP:-<test_freq/final>}"
 echo "  Reward fn:       ${REWARD_FN_PATH:-<none>}"
 echo "  RL val files:    ${RL_VAL_FILES:-<none>}"
 echo "  Prompt template: ${PROMPT_TEMPLATE:-<default: think_answer>}"
@@ -280,6 +282,7 @@ python3 -m self_distill_hybrid.main_opsd \
     opsd.sd_max_tokens="${SD_MAX_TOKENS}" \
     opsd.val_max_tokens="${VAL_MAX_TOKENS}" \
     ${TEST_FREQ:+opsd.test_freq="${TEST_FREQ}"} \
+    ${TEST_STEP:+opsd.test_step="${TEST_STEP}"} \
     opsd.teacher_update_freq="${TEACHER_UPDATE_FREQ}" \
     \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
